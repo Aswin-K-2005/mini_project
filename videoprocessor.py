@@ -1,5 +1,5 @@
 """
-video_processor_test_complete.py - Full test with hand gesture detection
+video_processor.py - Full test with hand gesture detection
 Includes multiple blur methods for maximum privacy
 """
 
