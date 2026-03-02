@@ -25,7 +25,7 @@ Recommended (full features)
 ```powershell
 pip install pyaudio                  # plays the beep (or use alternate audio lib)
 pip install sentence-transformers    # best results for semantic detection
-pip install mediapipe                # optional: hand gesture detection
+pip install "mediapipe<0.10.8"       # optional: hand gesture detection (required for current API)
 ```
 
 Quick start
@@ -52,7 +52,7 @@ Key design notes
 - Video nudity detection: now prefers NudeNet. If unavailable, OpenCV Haar face detection is used as fallback for privacy masking.
 - Semantic detection: uses `sentence-transformers` if installed; otherwise reverts to keyword matching.
 - STT-first audio filtering: optional `faster-whisper` transcription with word timestamps enables beeping only on bad words while preserving safe words.
-- Gesture detection: uses MediaPipe if available and disables gracefully when it isn't installed.
+- Gesture detection: uses MediaPipe if available (current implementation expects `mediapipe<0.10.8` API) and disables gracefully when unavailable.
 
 Configuration tips
 - Tweak detection sensitivity via `SemanticProfanityDetector`'s similarity threshold.

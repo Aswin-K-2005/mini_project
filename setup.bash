@@ -19,7 +19,7 @@ pip install \
   opencv-python \
   pyaudio \
   sentence-transformers \
-  mediapipe \
+  "mediapipe<0.10.8" \
   faster-whisper \
   nudenet
 

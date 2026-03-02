@@ -8,7 +8,7 @@ sentence-transformers
 better-profanity
 
 # Video / gesture / NSFW
-mediapipe
+mediapipe<0.10.8
 nudenet
 
 # STT + selective beep censoring
