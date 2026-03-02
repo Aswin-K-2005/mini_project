@@ -8,6 +8,12 @@ import numpy as np
 from collections import deque
 import time
 
+try:
+    from nudenet import NudeDetector
+    NUDENET_AVAILABLE = True
+except ImportError:
+    NUDENET_AVAILABLE = False
+
 # MediaPipe import with version compatibility
 try:
     import mediapipe as mp
@@ -21,7 +27,7 @@ except ImportError:
 class VideoProcessorTestComplete:
     """
     Complete test version with:
-    - Face detection (replaces NudeNet)
+    - NudeNet detection (with face fallback)
     - Hand gesture detection (MediaPipe)
     - Multiple blur modes (pixelation, heavy blur, black boxes)
     - Motion tracking
@@ -41,15 +47,25 @@ class VideoProcessorTestComplete:
         print(f"✓ Blur mode: {blur_mode.upper()}")
         
         # ══════════════════════════════════════════════════════════════════
-        # FACE DETECTION
+        # NUDITY DETECTION (NudeNet preferred, face fallback)
         # ══════════════════════════════════════════════════════════════════
+        self.nude_detector = None
+        self.nudenet_available = False
+        if NUDENET_AVAILABLE:
+            try:
+                self.nude_detector = NudeDetector()
+                self.nudenet_available = True
+                print("✓ NudeNet detector loaded")
+            except Exception as e:
+                print(f"⚠ NudeNet init failed: {e}. Using face fallback.")
+
         self.face_cascade = cv2.CascadeClassifier(
             cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
         )
-        
         if self.face_cascade.empty():
             raise Exception("ERROR: Could not load face cascade!")
-        print("✓ Face detector loaded")
+        if not self.nudenet_available:
+            print("✓ Face detector fallback loaded")
         
         # ══════════════════════════════════════════════════════════════════
         # MEDIAPIPE HANDS - with version compatibility
@@ -106,6 +122,7 @@ class VideoProcessorTestComplete:
         
         # Stats
         self.stats = {
+            'nude_regions_detected': 0,
             'faces_detected': 0,
             'gestures_detected': 0,
             'frames_skipped': 0,
@@ -153,6 +170,41 @@ class VideoProcessorTestComplete:
     # DETECTION METHODS
     # ══════════════════════════════════════════════════════════════════════
     
+
+    def detect_nudity(self, frame):
+        """Detect NSFW regions via NudeNet when available."""
+        if not self.nudenet_available:
+            return []
+
+        detections = self.nude_detector.detect(frame)
+        regions = []
+        h, w, _ = frame.shape
+
+        for det in detections:
+            score = float(det.get('score', 0.0))
+            if score < 0.45:
+                continue
+
+            x, y, bw, bh = det.get('box', [0, 0, 0, 0])
+            x = max(0, int(x))
+            y = max(0, int(y))
+            bw = min(w - x, int(bw))
+            bh = min(h - y, int(bh))
+            if bw <= 0 or bh <= 0:
+                continue
+
+            regions.append({
+                'x': x,
+                'y': y,
+                'width': bw,
+                'height': bh,
+                'confidence': score,
+                'class': det.get('class', 'EXPOSED')
+            })
+            self.stats['nude_regions_detected'] += 1
+
+        return regions
+
     def detect_faces(self, frame):
         """Detect faces - replaces NudeNet"""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -353,16 +405,20 @@ class VideoProcessorTestComplete:
         if self.frame_count % (self.skip_frames + 1) == 0:
             self.stats['detection_mode'] = 'DETECTING'
             
-            # Detect faces
-            face_regions = self.detect_faces(frame)
-            blur_regions.extend(face_regions)
-            
+            # Detect nudity (preferred) or faces (fallback)
+            if self.nudenet_available:
+                primary_regions = self.detect_nudity(frame)
+            else:
+                primary_regions = self.detect_faces(frame)
+
+            blur_regions.extend(primary_regions)
+
             # Update tracking
-            if face_regions:
-                self.tracked_faces = face_regions.copy()
+            if primary_regions:
+                self.tracked_faces = primary_regions.copy()
                 self.track_points = []
                 
-                for region in face_regions:
+                for region in primary_regions:
                     cx = region['x'] + region['width'] // 2
                     cy = region['y'] + region['height'] // 2
                     self.track_points.append([[cx, cy]])
@@ -370,7 +426,7 @@ class VideoProcessorTestComplete:
                 if self.track_points:
                     self.track_points = np.float32(self.track_points).reshape(-1, 1, 2)
             
-            self.detection_buffer.append(face_regions)
+            self.detection_buffer.append(primary_regions)
             self.prev_gray = gray.copy()
         
         # TRACKING MODE
@@ -395,7 +451,7 @@ class VideoProcessorTestComplete:
         metadata = {
             'timestamp': timestamp,
             'blur_count': len(blur_regions),
-            'faces_detected': len([r for r in blur_regions if 'class' in r]),
+            'sensitive_regions_detected': len([r for r in blur_regions if 'class' in r]),
             'gestures_detected': len([r for r in blur_regions if 'type' in r]),
             'detection_mode': self.stats['detection_mode'],
             'frame_count': self.frame_count
@@ -433,7 +489,7 @@ if __name__ == "__main__":
     print(f"Using blur mode: {blur_mode.upper()}")
     print("=" * 70)
     print("\nTests:")
-    print("  ✓ Face detection (stands in for NudeNet)")
+    print("  ✓ NudeNet detection (face fallback if missing)")
     print("  ✓ Hand gesture detection (MediaPipe)")
     print("  ✓ Motion tracking")
     print("  ✓ Frame skipping optimization")
@@ -483,7 +539,7 @@ if __name__ == "__main__":
                 f"FPS: {fps_display}",
                 f"Mode: {metadata['detection_mode']}",
                 f"Blur: {blur_mode.upper()}",
-                f"Faces: {metadata['faces_detected']}",
+                f"Sensitive regions: {metadata['sensitive_regions_detected']}",
                 f"Gestures: {metadata['gestures_detected']}"
             ]
             
@@ -506,7 +562,7 @@ if __name__ == "__main__":
     finally:
         print("\n" + "=" * 70)
         print("FINAL STATISTICS:")
-        print(f"  Total faces detected: {processor.stats['faces_detected']}")
+        print(f"  Total sensitive regions: {processor.stats['nude_regions_detected'] if processor.nudenet_available else processor.stats['faces_detected']}")
         print(f"  Total gestures detected: {processor.stats['gestures_detected']}")
         print(f"  Frames skipped: {processor.stats['frames_skipped']}")
         print(f"  Blur mode used: {blur_mode.upper()}")
