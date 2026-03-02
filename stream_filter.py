@@ -188,6 +188,7 @@ class StreamingFilterProduction:
         self.last_stt_at = 0.0
         self.stt_queue = Queue(maxsize=2)
         self.audio_sync_cache = deque(maxlen=256)
+        self.latest_audio_packet = None
 
         self.stats = {
             'capture_fps': 0.0,
@@ -409,7 +410,9 @@ class StreamingFilterProduction:
                     delayed_audio[:n] = self.beep_sound[:n]
 
                 delayed_audio = self._apply_scheduled_beeps(delayed_audio, delayed_ts)
-                self._bounded_put(self.audio_queue, {'audio': delayed_audio, 'ts': delayed_ts}, 'drops_audio_queue')
+                packet = {'audio': delayed_audio, 'ts': delayed_ts}
+                self.latest_audio_packet = packet
+                self._bounded_put(self.audio_queue, packet, 'drops_audio_queue')
         finally:
             stream_in.stop_stream()
             stream_in.close()
@@ -448,9 +451,13 @@ class StreamingFilterProduction:
 
             if matched_audio is None or best_diff_ms > self.config.sync_tolerance_ms:
                 self._safe_stat_inc('sync_drops')
-                # keep video smooth under temporary audio mismatch
-                silence = np.zeros(self.audio_chunk, dtype=np.float32)
-                pkt = AVPacket(video_pkt['frame'], silence, v_ts, video_pkt.get('metadata', {}))
+                # keep output audible: reuse latest processed audio when sync misses
+                fallback = self.latest_audio_packet
+                if fallback is not None:
+                    pkt = AVPacket(video_pkt['frame'], fallback['audio'], v_ts, video_pkt.get('metadata', {}))
+                else:
+                    silence = np.zeros(self.audio_chunk, dtype=np.float32)
+                    pkt = AVPacket(video_pkt['frame'], silence, v_ts, video_pkt.get('metadata', {}))
                 self._bounded_put(self.output_queue, pkt, 'drops_stale')
                 continue
 

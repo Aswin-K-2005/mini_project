@@ -115,3 +115,5 @@ Live stream profanity beep replacement
   - `--stt-model-size` (default `base`)
   - `--stt-window-s` and `--stt-poll-interval-s` (latency/accuracy tuning)
   - `--stt-temp-wav` (temporary transcription audio file path)
+
+- If you do not hear mic audio while video is visible, set a correct output device with `--audio-output-device-index` and use latest version where sync-miss fallback reuses latest processed audio instead of silence.
