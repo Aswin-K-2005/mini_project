@@ -12,6 +12,7 @@ Multi-model ensemble approach:
 import numpy as np
 import re
 from collections import defaultdict, deque
+from functools import lru_cache
 import time
 
 # Imports with fallbacks
@@ -28,6 +29,48 @@ try:
 except ImportError:
     PROFANITY_LIB_AVAILABLE = False
     print("⚠ better-profanity not available")
+
+try:
+    from faster_whisper import WhisperModel
+    FASTER_WHISPER_AVAILABLE = True
+except ImportError:
+    FASTER_WHISPER_AVAILABLE = False
+
+
+class AudioTranscriber:
+    """STT front-end for profanity filtering pipelines."""
+
+    def __init__(self, model_size='base', device='cpu'):
+        self.available = FASTER_WHISPER_AVAILABLE
+        self.model = None
+        if self.available:
+            try:
+                self.model = WhisperModel(model_size, device=device, compute_type='int8')
+            except Exception as exc:
+                print(f"⚠ Failed to initialize faster-whisper: {exc}")
+                self.available = False
+
+    def transcribe_with_timestamps(self, audio_path):
+        if not self.available or not self.model:
+            return {'text': '', 'segments': []}
+
+        segments, _ = self.model.transcribe(audio_path, vad_filter=True, word_timestamps=True)
+        out = []
+        full_text = []
+        for seg in segments:
+            seg_text = (seg.text or '').strip()
+            if seg_text:
+                full_text.append(seg_text)
+            words = []
+            for word in getattr(seg, 'words', []) or []:
+                words.append({
+                    'word': (word.word or '').strip(),
+                    'start': float(word.start),
+                    'end': float(word.end)
+                })
+            out.append({'text': seg_text, 'start': float(seg.start), 'end': float(seg.end), 'words': words})
+
+        return {'text': ' '.join(full_text).strip(), 'segments': out}
 
 
 class AdvancedProfanityDetector:
@@ -288,12 +331,22 @@ class AdvancedProfanityDetector:
         
         return matches
     
+    @lru_cache(maxsize=512)
+    def _cached_encode(self, text):
+        if not self.embeddings_available:
+            return None
+        return self.model.encode([text])[0]
+
+    @staticmethod
+    def _normalize_token(token):
+        return re.sub(r"[^a-z0-9]+", "", token.lower())
+
     def detect_semantic(self, text):
         """Method 3: Semantic similarity (catches variants, multilingual)"""
         if not self.embeddings_available or not text:
             return []
         
-        text_embedding = self.model.encode([text])[0]
+        text_embedding = self._cached_encode(text.lower())
         matches = []
         
         # Check severe profanity
@@ -416,6 +469,84 @@ class AdvancedProfanityDetector:
         
         return is_profane, final_confidence, unique_matches
     
+    def detect_words(self, words):
+        """Run profanity detection per word and keep original words untouched."""
+        flagged = []
+        for idx, word in enumerate(words):
+            clean = self._normalize_token(word)
+            if not clean:
+                continue
+            is_profane, confidence, matches = self.detect(clean)
+            if is_profane:
+                flagged.append({
+                    'index': idx,
+                    'word': word,
+                    'confidence': confidence,
+                    'matches': matches
+                })
+        return flagged
+
+    def censor_transcript(self, transcript_payload, replacement='[BEEP]'):
+        """Replace only profane words in transcript while preserving clean words."""
+        censored_segments = []
+        total_flagged = 0
+
+        for seg in transcript_payload.get('segments', []):
+            words = seg.get('words') or []
+            if not words:
+                continue
+
+            raw_words = [w.get('word', '') for w in words]
+            flagged = self.detect_words(raw_words)
+            bad_indexes = {item['index'] for item in flagged}
+            total_flagged += len(bad_indexes)
+
+            censored_words = []
+            word_events = []
+            for i, word_info in enumerate(words):
+                original = word_info.get('word', '')
+                is_bad = i in bad_indexes
+                final_word = replacement if is_bad else original
+                censored_words.append(final_word)
+                if is_bad:
+                    word_events.append({
+                        'word': original,
+                        'start': float(word_info.get('start', 0.0)),
+                        'end': float(word_info.get('end', 0.0))
+                    })
+
+            censored_segments.append({
+                'start': float(seg.get('start', 0.0)),
+                'end': float(seg.get('end', 0.0)),
+                'text': ' '.join(censored_words).strip(),
+                'word_events': word_events
+            })
+
+        return {
+            'text': ' '.join(s['text'] for s in censored_segments).strip(),
+            'segments': censored_segments,
+            'flagged_words': total_flagged
+        }
+
+    def censor_audio_by_word_timestamps(self, audio_samples, sample_rate, word_events, beep_frequency=1000):
+        """Overlay beeps only over profane words, keeping other audio intact."""
+        output = audio_samples.astype(np.float32).copy()
+        if output.ndim != 1:
+            output = output.reshape(-1)
+
+        for event in word_events:
+            start_idx = max(0, int(event['start'] * sample_rate))
+            end_idx = min(len(output), int(event['end'] * sample_rate))
+            if end_idx <= start_idx:
+                continue
+
+            duration = (end_idx - start_idx) / sample_rate
+            t = np.linspace(0, duration, end_idx - start_idx, endpoint=False)
+            beep = 0.35 * np.sin(2 * np.pi * beep_frequency * t)
+            output[start_idx:end_idx] = beep
+
+        return np.clip(output, -1.0, 1.0)
+
     # ══════════════════════════════════════════════════════════════════════
     # FEEDBACK & IMPROVEMENT
     # ══════════════════════════════════════════════════════════════════════
