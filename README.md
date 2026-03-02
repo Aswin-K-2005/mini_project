@@ -17,7 +17,7 @@ Install (Windows — minimal)
 
 ```powershell
 python -m pip install --upgrade pip
-pip install numpy opencv-python
+pip install -r requirements.txt
 ```
 
 Recommended (full features)
