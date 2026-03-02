@@ -44,6 +44,7 @@ class FilterConfig:
     stt_window_s: float = 2.0
     stt_poll_interval_s: float = 1.2
     stt_temp_wav: str = 'live_stt_window.wav'
+    stt_force_keyword_fallback: bool = True
 
 
 @dataclass
@@ -289,6 +290,29 @@ class StreamingFilterProduction:
             except Exception:
                 pass
 
+
+    def _segment_is_profane_fast(self, text):
+        """Aggressive fallback for live stream: keyword + phonetic checks."""
+        if not text:
+            return False
+
+        normalized = text.lower()
+
+        # Fast exact severe-word trigger
+        severe_words = getattr(self.audio_detector, 'severe_words', [])
+        for w in severe_words:
+            if f" {w} " in f" {normalized} ":
+                return True
+
+        # Phonetic fallback from detector patterns
+        try:
+            if self.audio_detector.detect_phonetic(normalized):
+                return True
+        except Exception:
+            pass
+
+        return False
+
     def _stt_thread(self):
         cfg = self.config
         while not self.stop_event.is_set():
@@ -326,6 +350,11 @@ class StreamingFilterProduction:
                         if not word_events and idx < len(raw_segments):
                             raw_text = raw_segments[idx].get('text', '').strip()
                             is_profane, _, _ = self.audio_detector.detect(raw_text)
+
+                            # Extra aggressive fallback for live censoring reliability
+                            if (not is_profane) and self.config.stt_force_keyword_fallback:
+                                is_profane = self._segment_is_profane_fast(raw_text)
+
                             if is_profane:
                                 ev_start = start_ts + float(raw_segments[idx].get('start', 0.0))
                                 ev_end = start_ts + float(raw_segments[idx].get('end', 0.0))
@@ -672,6 +701,7 @@ def parse_args():
     parser.add_argument('--stt-window-s', type=float, default=2.0)
     parser.add_argument('--stt-poll-interval-s', type=float, default=1.2)
     parser.add_argument('--stt-temp-wav', default='live_stt_window.wav')
+    parser.add_argument('--disable-stt-force-keyword-fallback', action='store_true')
     parser.add_argument('--list-audio-devices', action='store_true')
     return parser.parse_args()
 
@@ -701,6 +731,7 @@ if __name__ == '__main__':
         stt_window_s=args.stt_window_s,
         stt_poll_interval_s=args.stt_poll_interval_s,
         stt_temp_wav=args.stt_temp_wav,
+        stt_force_keyword_fallback=not args.disable_stt_force_keyword_fallback,
     )
 
     print('=' * 70)

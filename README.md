@@ -122,3 +122,5 @@ Live stream profanity beep replacement
 - Beep-detection tip: if beeps are missed, run with `--stt-model-size base` (or `small`) for better transcription accuracy.
 
 - If `live_stt_runs` increases but `live_stt_profanity_hits` stays near zero, switch to `--stt-model-size base` and speak clear isolated words while testing (fallback now checks original STT segments too).
+
+- Reliability flag: use `--disable-stt-force-keyword-fallback` only if you want strict model-only behavior. By default, live mode uses an extra keyword/phonetic fallback to avoid missed beeps.
