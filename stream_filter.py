@@ -236,7 +236,7 @@ class StreamingFilterProduction:
 
     def _generate_beep(self, duration_ms=250, frequency=1000):
         t = np.linspace(0, duration_ms / 1000.0, int(self.audio_rate * duration_ms / 1000.0), endpoint=False)
-        return (0.35 * np.sin(2 * np.pi * frequency * t)).astype(np.float32)
+        return (0.55 * np.sin(2 * np.pi * frequency * t)).astype(np.float32)
 
     def _bounded_put(self, queue_obj, item, drop_stat_key):
         try:
@@ -307,9 +307,12 @@ class StreamingFilterProduction:
                 hit_count = 0
                 now_cutoff = time.monotonic() - 1.0
 
+                raw_segments = transcript.get('segments', [])
+                censored_segments = result.get('segments', [])
+
                 with self.beep_lock:
-                    for seg in result.get('segments', []):
-                        word_events = seg.get('word_events', [])
+                    for idx, censored_seg in enumerate(censored_segments):
+                        word_events = censored_seg.get('word_events', [])
 
                         # Primary path: beep exact profane word timings.
                         for word_event in word_events:
@@ -319,14 +322,13 @@ class StreamingFilterProduction:
                                 self.beep_events.append((ev_start, ev_end))
                                 hit_count += 1
 
-                        # Fallback path: if word timings are absent but segment is profane,
-                        # beep whole segment so users still hear censorship in live stream.
-                        if not word_events:
-                            seg_text = seg.get('text', '').strip()
-                            is_profane, _, _ = self.audio_detector.detect(seg_text)
+                        # Fallback path: if word timings are absent, evaluate ORIGINAL STT text.
+                        if not word_events and idx < len(raw_segments):
+                            raw_text = raw_segments[idx].get('text', '').strip()
+                            is_profane, _, _ = self.audio_detector.detect(raw_text)
                             if is_profane:
-                                ev_start = start_ts + float(seg.get('start', 0.0))
-                                ev_end = start_ts + float(seg.get('end', 0.0))
+                                ev_start = start_ts + float(raw_segments[idx].get('start', 0.0))
+                                ev_end = start_ts + float(raw_segments[idx].get('end', 0.0))
                                 if ev_end > now_cutoff and ev_end > ev_start:
                                     self.beep_events.append((ev_start, ev_end))
                                     hit_count += 1

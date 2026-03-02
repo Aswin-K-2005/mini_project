@@ -120,3 +120,5 @@ Live stream profanity beep replacement
 
 - Audio clarity tip: use headphones (avoid speaker feedback) and set a fixed output device via `--audio-output-device-index`.
 - Beep-detection tip: if beeps are missed, run with `--stt-model-size base` (or `small`) for better transcription accuracy.
+
+- If `live_stt_runs` increases but `live_stt_profanity_hits` stays near zero, switch to `--stt-model-size base` and speak clear isolated words while testing (fallback now checks original STT segments too).
