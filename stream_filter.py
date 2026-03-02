@@ -190,6 +190,7 @@ class StreamingFilterProduction:
         self.stt_queue = Queue(maxsize=2)
         self.audio_sync_cache = deque(maxlen=256)
         self.latest_audio_packet = None
+        self.last_audio_write_ts = time.monotonic()
 
         self.stats = {
             'capture_fps': 0.0,
@@ -364,6 +365,15 @@ class StreamingFilterProduction:
 
                 if hit_count:
                     self._safe_stat_inc('live_stt_profanity_hits', hit_count)
+                else:
+                    # Emergency fallback: if transcript text is profane but no timings,
+                    # schedule a short immediate beep so censorship is still audible.
+                    full_text = (transcript.get('text', '') or '').strip()
+                    if full_text and self._segment_is_profane_fast(full_text):
+                        now_ts = time.monotonic()
+                        with self.beep_lock:
+                            self.beep_events.append((now_ts, now_ts + 0.28))
+                        self._safe_stat_inc('live_stt_profanity_hits', 1)
             except Exception:
                 self._safe_stat_inc('runtime_errors')
             finally:
@@ -583,7 +593,17 @@ class StreamingFilterProduction:
                     virtual_cam.send(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
                     virtual_cam.sleep_until_next_frame()
 
-                audio_out.write(pkt.audio.astype(np.float32).tobytes())
+                audio_chunk = pkt.audio.astype(np.float32)
+                now_ts = time.monotonic()
+                elapsed = max(0.0, now_ts - self.last_audio_write_ts)
+                chunk_duration = len(audio_chunk) / float(self.audio_rate)
+                repeats = 1
+                if chunk_duration > 0:
+                    repeats = max(1, int(round(elapsed / chunk_duration)))
+                    repeats = min(repeats, 3)
+                for _ in range(repeats):
+                    audio_out.write(audio_chunk.tobytes(), exception_on_underflow=False)
+                self.last_audio_write_ts = now_ts
 
                 fps_count += 1
                 self._safe_stat_inc('frames_output')

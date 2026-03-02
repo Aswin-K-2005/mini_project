@@ -124,3 +124,5 @@ Live stream profanity beep replacement
 - If `live_stt_runs` increases but `live_stt_profanity_hits` stays near zero, switch to `--stt-model-size base` and speak clear isolated words while testing (fallback now checks original STT segments too).
 
 - Reliability flag: use `--disable-stt-force-keyword-fallback` only if you want strict model-only behavior. By default, live mode uses an extra keyword/phonetic fallback to avoid missed beeps.
+
+- If audio is crackling under heavy load, try `--blur-mode pixelation` and `--stt-model-size tiny`; latest build also uses adaptive audio writes to reduce underflow crackle when FPS drops.
