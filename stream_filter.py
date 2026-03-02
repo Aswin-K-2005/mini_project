@@ -401,8 +401,11 @@ class StreamingFilterProduction:
                 except Empty:
                     break
 
+            # Audio timestamps are intentionally delayed; match against expected delayed timestamp.
+            expected_audio_ts = v_ts - (self.audio_delay.target_delay_ms / 1000.0)
+
             for pkt in candidates:
-                diff_ms = abs((pkt['ts'] - v_ts) * 1000.0)
+                diff_ms = abs((pkt['ts'] - expected_audio_ts) * 1000.0)
                 if diff_ms < best_diff_ms:
                     best_diff_ms = diff_ms
                     matched_audio = pkt
