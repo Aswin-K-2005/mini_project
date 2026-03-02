@@ -17,7 +17,7 @@ Install (Windows — minimal)
 
 ```powershell
 python -m pip install --upgrade pip
-pip install numpy opencv-python
+pip install -r requirements.txt
 ```
 
 Recommended (full features)
@@ -49,8 +49,9 @@ python audio_processor.py
   - The demo runs several phrases and plays a beep for detected profanity.
 
 Key design notes
-- Face detection: uses OpenCV Haar cascades as a fast local stand-in. Swap in NudeNet or other detectors for production use.
+- Video nudity detection: now prefers NudeNet. If unavailable, OpenCV Haar face detection is used as fallback for privacy masking.
 - Semantic detection: uses `sentence-transformers` if installed; otherwise reverts to keyword matching.
+- STT-first audio filtering: optional `faster-whisper` transcription with word timestamps enables beeping only on bad words while preserving safe words.
 - Gesture detection: uses MediaPipe if available and disables gracefully when it isn't installed.
 
 Configuration tips
@@ -72,3 +73,45 @@ Next steps (pick one)
 - I can generate screenshots / a GIF showing blur levels.
 
 Tell me which option you want and I'll implement it.
+
+
+Selective word beep pipeline (new)
+- Use `AudioTranscriber.transcribe_with_timestamps(audio_path)` to get text + word timing.
+- Pass the payload to `AdvancedProfanityDetector.censor_transcript(...)` to replace only profane words.
+- Apply `censor_audio_by_word_timestamps(...)` to beep only flagged word intervals in the waveform.
+
+
+Production stream routing (camera + mic for other apps)
+- `stream_filter.py` now captures raw webcam + microphone, applies filtering, and enforces bounded latency (drops stale packets instead of allowing cumulative delay growth).
+- Virtual camera output: install `pyvirtualcam` and set `use_virtual_cam=True` in `StreamingFilterProduction`.
+- Virtual microphone routing: set `audio_output_device_index` to a virtual cable output device (for example VB-CABLE output). In conferencing apps, choose the corresponding cable input as microphone.
+- Latency controls:
+  - `target_latency_ms`: desired steady-state delay.
+  - `max_latency_ms`: hard upper bound; stale packets are dropped.
+  - `sync_tolerance_ms`: A/V timestamp matching window.
+
+
+Production hardening updates
+- `stream_filter.py` now supports CLI configuration (`--target-latency-ms`, `--max-latency-ms`, `--sync-tolerance-ms`, `--use-virtual-cam`, `--audio-output-device-index`).
+- Added `--list-audio-devices` helper for selecting virtual cable output devices safely.
+- Added periodic JSONL health logging (`runtime_health.jsonl`) with FPS/latency/drop counters for long-run validation.
+- Internal timing now uses monotonic clocks for stable sync calculations.
+
+Suggested production acceptance targets
+- p95 end-to-end latency <= 220ms
+- p99 end-to-end latency <= 280ms
+- sync offset p95 <= 40ms
+- stale/drop rate <= 2% over 30+ minutes
+
+
+Safe environment setup script
+- Run `bash setup.bash` to create an isolated `.venv` and install dependencies without touching system Python.
+- This reduces OS-level conflicts and keeps the runtime contained for production deployments.
+
+Live stream profanity beep replacement
+- `stream_filter.py` now supports live STT censoring so profane spoken words are replaced by beep in streamed audio output.
+- New flags:
+  - `--disable-live-stt-censor` (turn off live STT censoring)
+  - `--stt-model-size` (default `base`)
+  - `--stt-window-s` and `--stt-poll-interval-s` (latency/accuracy tuning)
+  - `--stt-temp-wav` (temporary transcription audio file path)

@@ -1,0 +1,20 @@
+# Core runtime
+numpy
+opencv-python
+pyaudio
+
+# NLP / profanity detection
+sentence-transformers
+better-profanity
+
+# Video / gesture / NSFW
+mediapipe
+nudenet
+
+# STT + selective beep censoring
+faster-whisper
+SpeechRecognition
+pydub
+
+# Virtual device routing
+pyvirtualcam
