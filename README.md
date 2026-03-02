@@ -127,4 +127,6 @@ Live stream profanity beep replacement
 
 - If audio is crackling under heavy load, try `--blur-mode pixelation` and `--stt-model-size tiny`; latest build also uses adaptive audio writes to reduce underflow crackle when FPS drops.
 
-- Timing alignment tip: use `--stt-alignment-delay-ms 300` to `450` so beep events arrive before playback; this improves bad-word replacement accuracy at the cost of added stream latency.
+- Timing alignment tip: use `--stt-alignment-delay-ms 300` to `450` so beep events arrive before playback; this improves bad-word replacement accuracy at the cost of added stream latency. Sync matcher now includes this delay in A/V timestamp alignment.
+
+- Performance tip: use `--blur-mode pixelation --video-detection-interval 3` (or `4`) to reduce CPU load and recover FPS when live STT is enabled.

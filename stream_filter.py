@@ -28,7 +28,7 @@ except ImportError:
 
 @dataclass
 class FilterConfig:
-    blur_mode: str = 'heavy'
+    blur_mode: str = 'pixelation'
     recall_mode: str = 'high'
     video_source: int = 0
     target_latency_ms: float = 150.0
@@ -46,6 +46,7 @@ class FilterConfig:
     stt_temp_wav: str = 'live_stt_window.wav'
     stt_force_keyword_fallback: bool = True
     stt_alignment_delay_ms: float = 350.0
+    video_detection_interval: int = 3
 
 
 @dataclass
@@ -428,7 +429,8 @@ class StreamingFilterProduction:
                 elapsed = max(1e-6, time.monotonic() - fps_start)
                 self._safe_stat_set('capture_fps', frame_count / elapsed)
 
-            if frame_count % 2 == 0:
+            detect_every = max(1, int(self.config.video_detection_interval))
+            if frame_count % detect_every == 0:
                 self.detection_worker.submit_frame(frame, ts)
 
             result = self.detection_worker.latest_result()
@@ -506,7 +508,7 @@ class StreamingFilterProduction:
                     break
 
             # Audio timestamps are intentionally delayed; match against expected delayed timestamp.
-            expected_audio_ts = v_ts - (self.audio_delay.target_delay_ms / 1000.0)
+            expected_audio_ts = v_ts - ((self.audio_delay.target_delay_ms + self.config.stt_alignment_delay_ms) / 1000.0)
 
             # Trim stale cached audio to bound memory and avoid bad matches.
             cache_ttl_s = self.config.max_latency_ms / 1000.0
@@ -716,7 +718,7 @@ class StreamingFilterProduction:
 def parse_args():
     parser = argparse.ArgumentParser(description='NeonGuard production streaming filter')
     parser.add_argument('--video-source', type=int, default=0)
-    parser.add_argument('--blur-mode', default='heavy', choices=['pixelation', 'heavy', 'extreme', 'black'])
+    parser.add_argument('--blur-mode', default='pixelation', choices=['pixelation', 'heavy', 'extreme', 'black'])
     parser.add_argument('--recall-mode', default='high', choices=['high', 'balanced', 'precision'])
     parser.add_argument('--target-latency-ms', type=float, default=150.0)
     parser.add_argument('--max-latency-ms', type=float, default=230.0)
@@ -733,6 +735,7 @@ def parse_args():
     parser.add_argument('--stt-temp-wav', default='live_stt_window.wav')
     parser.add_argument('--disable-stt-force-keyword-fallback', action='store_true')
     parser.add_argument('--stt-alignment-delay-ms', type=float, default=350.0)
+    parser.add_argument('--video-detection-interval', type=int, default=3)
     parser.add_argument('--list-audio-devices', action='store_true')
     return parser.parse_args()
 
@@ -764,6 +767,7 @@ if __name__ == '__main__':
         stt_temp_wav=args.stt_temp_wav,
         stt_force_keyword_fallback=not args.disable_stt_force_keyword_fallback,
         stt_alignment_delay_ms=args.stt_alignment_delay_ms,
+        video_detection_interval=args.video_detection_interval,
     )
 
     print('=' * 70)
