@@ -45,6 +45,7 @@ class FilterConfig:
     stt_poll_interval_s: float = 1.2
     stt_temp_wav: str = 'live_stt_window.wav'
     stt_force_keyword_fallback: bool = True
+    stt_alignment_delay_ms: float = 350.0
 
 
 @dataclass
@@ -191,6 +192,7 @@ class StreamingFilterProduction:
         self.audio_sync_cache = deque(maxlen=256)
         self.latest_audio_packet = None
         self.last_audio_write_ts = time.monotonic()
+        self.pending_audio = deque()
 
         self.stats = {
             'capture_fps': 0.0,
@@ -474,8 +476,16 @@ class StreamingFilterProduction:
                 delayed_audio = self._apply_scheduled_beeps(delayed_audio, delayed_ts)
                 packet = {'audio': delayed_audio, 'ts': delayed_ts}
                 self.latest_audio_packet = packet
-                self._bounded_put(self.audio_queue, packet, 'drops_audio_queue')
+
+                # Hold audio briefly so STT beep events can arrive BEFORE playback.
+                self.pending_audio.append(packet)
+                hold_s = self.config.stt_alignment_delay_ms / 1000.0
+                now_mono = time.monotonic()
+                while self.pending_audio and (now_mono - self.pending_audio[0]['ts']) >= hold_s:
+                    self._bounded_put(self.audio_queue, self.pending_audio.popleft(), 'drops_audio_queue')
         finally:
+            while self.pending_audio:
+                self._bounded_put(self.audio_queue, self.pending_audio.popleft(), 'drops_audio_queue')
             stream_in.stop_stream()
             stream_in.close()
 
@@ -722,6 +732,7 @@ def parse_args():
     parser.add_argument('--stt-poll-interval-s', type=float, default=1.2)
     parser.add_argument('--stt-temp-wav', default='live_stt_window.wav')
     parser.add_argument('--disable-stt-force-keyword-fallback', action='store_true')
+    parser.add_argument('--stt-alignment-delay-ms', type=float, default=350.0)
     parser.add_argument('--list-audio-devices', action='store_true')
     return parser.parse_args()
 
@@ -752,6 +763,7 @@ if __name__ == '__main__':
         stt_poll_interval_s=args.stt_poll_interval_s,
         stt_temp_wav=args.stt_temp_wav,
         stt_force_keyword_fallback=not args.disable_stt_force_keyword_fallback,
+        stt_alignment_delay_ms=args.stt_alignment_delay_ms,
     )
 
     print('=' * 70)

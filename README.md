@@ -126,3 +126,5 @@ Live stream profanity beep replacement
 - Reliability flag: use `--disable-stt-force-keyword-fallback` only if you want strict model-only behavior. By default, live mode uses an extra keyword/phonetic fallback to avoid missed beeps.
 
 - If audio is crackling under heavy load, try `--blur-mode pixelation` and `--stt-model-size tiny`; latest build also uses adaptive audio writes to reduce underflow crackle when FPS drops.
+
+- Timing alignment tip: use `--stt-alignment-delay-ms 300` to `450` so beep events arrive before playback; this improves bad-word replacement accuracy at the cost of added stream latency.
