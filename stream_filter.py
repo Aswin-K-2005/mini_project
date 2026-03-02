@@ -40,9 +40,9 @@ class FilterConfig:
     health_log_path: str = 'runtime_health.jsonl'
     health_log_interval_s: float = 5.0
     enable_live_stt_censor: bool = True
-    stt_model_size: str = 'base'
+    stt_model_size: str = 'tiny'
     stt_window_s: float = 2.0
-    stt_poll_interval_s: float = 0.8
+    stt_poll_interval_s: float = 1.2
     stt_temp_wav: str = 'live_stt_window.wav'
 
 
@@ -304,14 +304,35 @@ class StreamingFilterProduction:
                 transcript = self.audio_transcriber.transcribe_with_timestamps(cfg.stt_temp_wav)
                 result = self.audio_detector.censor_transcript(transcript)
                 self._safe_stat_inc('live_stt_runs')
+                hit_count = 0
+                now_cutoff = time.monotonic() - 1.0
+
                 with self.beep_lock:
                     for seg in result.get('segments', []):
-                        for word_event in seg.get('word_events', []):
+                        word_events = seg.get('word_events', [])
+
+                        # Primary path: beep exact profane word timings.
+                        for word_event in word_events:
                             ev_start = start_ts + float(word_event['start'])
                             ev_end = start_ts + float(word_event['end'])
-                            if ev_end > time.monotonic() - 1.0:
+                            if ev_end > now_cutoff:
                                 self.beep_events.append((ev_start, ev_end))
-                                self._safe_stat_inc('live_stt_profanity_hits')
+                                hit_count += 1
+
+                        # Fallback path: if word timings are absent but segment is profane,
+                        # beep whole segment so users still hear censorship in live stream.
+                        if not word_events:
+                            seg_text = seg.get('text', '').strip()
+                            is_profane, _, _ = self.audio_detector.detect(seg_text)
+                            if is_profane:
+                                ev_start = start_ts + float(seg.get('start', 0.0))
+                                ev_end = start_ts + float(seg.get('end', 0.0))
+                                if ev_end > now_cutoff and ev_end > ev_start:
+                                    self.beep_events.append((ev_start, ev_end))
+                                    hit_count += 1
+
+                if hit_count:
+                    self._safe_stat_inc('live_stt_profanity_hits', hit_count)
             except Exception:
                 self._safe_stat_inc('runtime_errors')
             finally:
@@ -645,9 +666,9 @@ def parse_args():
     parser.add_argument('--health-log-path', default='runtime_health.jsonl')
     parser.add_argument('--health-log-interval-s', type=float, default=5.0)
     parser.add_argument('--disable-live-stt-censor', action='store_true')
-    parser.add_argument('--stt-model-size', default='base')
+    parser.add_argument('--stt-model-size', default='tiny')
     parser.add_argument('--stt-window-s', type=float, default=2.0)
-    parser.add_argument('--stt-poll-interval-s', type=float, default=0.8)
+    parser.add_argument('--stt-poll-interval-s', type=float, default=1.2)
     parser.add_argument('--stt-temp-wav', default='live_stt_window.wav')
     parser.add_argument('--list-audio-devices', action='store_true')
     return parser.parse_args()

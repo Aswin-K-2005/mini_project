@@ -112,8 +112,11 @@ Live stream profanity beep replacement
 - `stream_filter.py` now supports live STT censoring so profane spoken words are replaced by beep in streamed audio output.
 - New flags:
   - `--disable-live-stt-censor` (turn off live STT censoring)
-  - `--stt-model-size` (default `base`)
+  - `--stt-model-size` (default `tiny`)
   - `--stt-window-s` and `--stt-poll-interval-s` (latency/accuracy tuning)
   - `--stt-temp-wav` (temporary transcription audio file path)
 
 - If you do not hear mic audio while video is visible, set a correct output device with `--audio-output-device-index` and use latest version where sync-miss fallback reuses latest processed audio instead of silence.
+
+- Audio clarity tip: use headphones (avoid speaker feedback) and set a fixed output device via `--audio-output-device-index`.
+- Beep-detection tip: if beeps are missed, run with `--stt-model-size base` (or `small`) for better transcription accuracy.
