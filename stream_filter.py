@@ -179,12 +179,15 @@ class StreamingFilterProduction:
         self.stop_event = threading.Event()
         self.threads = []
         self.stats_lock = threading.Lock()
+        self.beep_lock = threading.Lock()
 
         self.beep_sound = self._generate_beep()
         self.beep_until = 0.0
         self.beep_events = deque(maxlen=400)
         self.audio_history = deque(maxlen=max(8, int(self.audio_rate * config.stt_window_s / self.audio_chunk) + 4))
         self.last_stt_at = 0.0
+        self.stt_queue = Queue(maxsize=2)
+        self.audio_sync_cache = deque(maxlen=256)
 
         self.stats = {
             'capture_fps': 0.0,
@@ -270,40 +273,67 @@ class StreamingFilterProduction:
 
         self.last_stt_at = now_mono
         start_ts = self.audio_history[0][1]
+        window = np.concatenate([a for a, _ in self.audio_history])
+        if window.size == 0:
+            return
+
+        payload = {'window': window.copy(), 'start_ts': start_ts}
         try:
-            window = np.concatenate([a for a, _ in self.audio_history])
-            if window.size == 0:
-                return
-            self._write_temp_wav(window, cfg.stt_temp_wav)
-            transcript = self.audio_transcriber.transcribe_with_timestamps(cfg.stt_temp_wav)
-            result = self.audio_detector.censor_transcript(transcript)
-            self._safe_stat_inc('live_stt_runs')
-            for seg in result.get('segments', []):
-                for word_event in seg.get('word_events', []):
-                    ev_start = start_ts + float(word_event['start'])
-                    ev_end = start_ts + float(word_event['end'])
-                    if ev_end > now_mono - 1.0:
-                        self.beep_events.append((ev_start, ev_end))
-                        self._safe_stat_inc('live_stt_profanity_hits')
+            self.stt_queue.put_nowait(payload)
         except Exception:
-            self._safe_stat_inc('runtime_errors')
-        finally:
-            if os.path.exists(cfg.stt_temp_wav):
-                try:
-                    os.remove(cfg.stt_temp_wav)
-                except OSError:
-                    pass
+            # keep real-time path healthy; drop old STT work when overloaded
+            try:
+                self.stt_queue.get_nowait()
+                self.stt_queue.put_nowait(payload)
+            except Exception:
+                pass
+
+    def _stt_thread(self):
+        cfg = self.config
+        while not self.stop_event.is_set():
+            try:
+                payload = self.stt_queue.get(timeout=0.2)
+            except Empty:
+                continue
+
+            window = payload['window']
+            start_ts = payload['start_ts']
+            try:
+                self._write_temp_wav(window, cfg.stt_temp_wav)
+                transcript = self.audio_transcriber.transcribe_with_timestamps(cfg.stt_temp_wav)
+                result = self.audio_detector.censor_transcript(transcript)
+                self._safe_stat_inc('live_stt_runs')
+                with self.beep_lock:
+                    for seg in result.get('segments', []):
+                        for word_event in seg.get('word_events', []):
+                            ev_start = start_ts + float(word_event['start'])
+                            ev_end = start_ts + float(word_event['end'])
+                            if ev_end > time.monotonic() - 1.0:
+                                self.beep_events.append((ev_start, ev_end))
+                                self._safe_stat_inc('live_stt_profanity_hits')
+            except Exception:
+                self._safe_stat_inc('runtime_errors')
+            finally:
+                if os.path.exists(cfg.stt_temp_wav):
+                    try:
+                        os.remove(cfg.stt_temp_wav)
+                    except OSError:
+                        pass
 
     def _apply_scheduled_beeps(self, audio_chunk, chunk_ts):
-        if not self.beep_events:
-            return audio_chunk
+        with self.beep_lock:
+            if not self.beep_events:
+                return audio_chunk
         out = audio_chunk.copy()
         chunk_end = chunk_ts + (len(out) / self.audio_rate)
 
-        while self.beep_events and self.beep_events[0][1] < chunk_ts - 0.3:
-            self.beep_events.popleft()
+        with self.beep_lock:
+            while self.beep_events and self.beep_events[0][1] < chunk_ts - 0.3:
+                self.beep_events.popleft()
 
-        for ev_start, ev_end in list(self.beep_events):
+            events_snapshot = list(self.beep_events)
+
+        for ev_start, ev_end in events_snapshot:
             overlap_start = max(chunk_ts, ev_start)
             overlap_end = min(chunk_end, ev_end)
             if overlap_end <= overlap_start:
@@ -394,25 +424,39 @@ class StreamingFilterProduction:
             v_ts = video_pkt['ts']
             matched_audio = None
             best_diff_ms = float('inf')
-            candidates = []
-            for _ in range(6):
+            for _ in range(8):
                 try:
-                    candidates.append(self.audio_queue.get_nowait())
+                    self.audio_sync_cache.append(self.audio_queue.get_nowait())
                 except Empty:
                     break
 
             # Audio timestamps are intentionally delayed; match against expected delayed timestamp.
             expected_audio_ts = v_ts - (self.audio_delay.target_delay_ms / 1000.0)
 
-            for pkt in candidates:
+            # Trim stale cached audio to bound memory and avoid bad matches.
+            cache_ttl_s = self.config.max_latency_ms / 1000.0
+            while self.audio_sync_cache and self.audio_sync_cache[0]['ts'] < expected_audio_ts - cache_ttl_s:
+                self.audio_sync_cache.popleft()
+
+            best_idx = None
+            for idx, pkt in enumerate(self.audio_sync_cache):
                 diff_ms = abs((pkt['ts'] - expected_audio_ts) * 1000.0)
                 if diff_ms < best_diff_ms:
                     best_diff_ms = diff_ms
                     matched_audio = pkt
+                    best_idx = idx
 
             if matched_audio is None or best_diff_ms > self.config.sync_tolerance_ms:
                 self._safe_stat_inc('sync_drops')
+                # keep video smooth under temporary audio mismatch
+                silence = np.zeros(self.audio_chunk, dtype=np.float32)
+                pkt = AVPacket(video_pkt['frame'], silence, v_ts, video_pkt.get('metadata', {}))
+                self._bounded_put(self.output_queue, pkt, 'drops_stale')
                 continue
+
+            # Remove used audio packet from cache
+            if best_idx is not None:
+                del self.audio_sync_cache[best_idx]
 
             e2e_ms = (time.monotonic() - v_ts) * 1000.0
             self._safe_stat_set('sync_offset_ms', best_diff_ms)
@@ -539,6 +583,7 @@ class StreamingFilterProduction:
         self.threads = [
             threading.Thread(target=self._video_thread, daemon=True),
             threading.Thread(target=self._audio_thread, daemon=True),
+            threading.Thread(target=self._stt_thread, daemon=True),
             threading.Thread(target=self._sync_thread, daemon=True),
             threading.Thread(target=self._output_thread, daemon=True),
             threading.Thread(target=self._health_thread, daemon=True),
