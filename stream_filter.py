@@ -194,6 +194,7 @@ class StreamingFilterProduction:
         self.latest_audio_packet = None
         self.last_audio_write_ts = time.monotonic()
         self.pending_audio = deque()
+        self.pending_video = deque()
 
         self.stats = {
             'capture_fps': 0.0,
@@ -441,7 +442,13 @@ class StreamingFilterProduction:
 
             out_frame = last_processed['frame'] if last_processed else frame
             metadata = last_processed['metadata'] if last_processed else {}
-            self._bounded_put(self.video_queue, {'frame': out_frame, 'ts': ts, 'metadata': metadata}, 'drops_video_queue')
+            self.pending_video.append({'frame': out_frame, 'ts': ts, 'metadata': metadata})
+
+            # Delay video by the same amount as audio so lip movement stays in sync.
+            hold_s = (self.audio_delay.target_delay_ms + self.config.stt_alignment_delay_ms) / 1000.0
+            now_mono = time.monotonic()
+            while self.pending_video and (now_mono - self.pending_video[0]['ts']) >= hold_s:
+                self._bounded_put(self.video_queue, self.pending_video.popleft(), 'drops_video_queue')
 
     def _audio_thread(self):
         stream_in = self.pyaudio.open(
@@ -507,8 +514,8 @@ class StreamingFilterProduction:
                 except Empty:
                     break
 
-            # Audio timestamps are intentionally delayed; match against expected delayed timestamp.
-            expected_audio_ts = v_ts - ((self.audio_delay.target_delay_ms + self.config.stt_alignment_delay_ms) / 1000.0)
+            # Video is delayed to match audio, so pair packets with similar capture timestamps.
+            expected_audio_ts = v_ts
 
             # Trim stale cached audio to bound memory and avoid bad matches.
             cache_ttl_s = self.config.max_latency_ms / 1000.0
@@ -543,7 +550,8 @@ class StreamingFilterProduction:
             self._safe_stat_set('sync_offset_ms', best_diff_ms)
             self._safe_stat_set('end_to_end_ms', e2e_ms)
 
-            if e2e_ms > self.config.max_latency_ms:
+            allowed_e2e_ms = self.config.max_latency_ms + self.audio_delay.target_delay_ms + self.config.stt_alignment_delay_ms
+            if e2e_ms > allowed_e2e_ms:
                 self._safe_stat_inc('drops_stale')
                 continue
 
