@@ -44,7 +44,12 @@ try:
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
-
+def _resolve_whisper_device(device):
+    if device and device != 'auto':
+        return device
+    if TORCH_AVAILABLE and getattr(torch, 'cuda', None) and torch.cuda.is_available():
+        return 'cuda'
+    return 'cpu'
 
 class AudioTranscriber:
     """STT front-end for profanity filtering pipelines."""
@@ -52,16 +57,19 @@ class AudioTranscriber:
     def __init__(self, model_size='base', device='auto'):
         self.available = FASTER_WHISPER_AVAILABLE
         self.model = None
-        self.device = self._resolve_device(device)
+        self.device = _resolve_whisper_device(device)
         self.compute_type = 'float16' if self.device == 'cuda' else 'int8'
         if self.available:
             try:
-                self.model = WhisperModel(model_size, device=self.device, compute_type=self.compute_type)
+                self.model = WhisperModel(
+                    model_size,
+                    device=self.device,
+                    compute_type=self.compute_type
+                )
                 print(f"[OK] faster-whisper running on {self.device.upper()} ({self.compute_type})")
             except Exception as exc:
                 print(f"[WARN] Failed to initialize faster-whisper on {self.device}: {exc}")
                 self.available = False
-
     def transcribe_with_timestamps(self, audio_source, vad_filter=True, language=None):
         if not self.available or not self.model:
             return {'text': '', 'segments': []}
