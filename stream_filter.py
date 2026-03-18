@@ -3,6 +3,7 @@ stream_filter.py - production-oriented low-latency A/V filtering pipeline.
 """
 
 import argparse
+import io
 import json
 import os
 import threading
@@ -57,8 +58,8 @@ class FilterConfig:
     stt_vad_filter: bool = False
     stt_language: str | None = "en"
     # Extra hold so STT results arrive before playback.
-    stt_alignment_delay_ms: float = 750.0
-    video_detection_interval: int = 3
+    stt_alignment_delay_ms: float = 350.0
+    video_detection_interval: int = 4
     enable_fast_audio_gate: bool = True
     # Lightweight safety net (still uses STT, but no word timestamps): forces an immediate beep.
     fast_gate_window_s: float = 0.8
@@ -411,14 +412,51 @@ class StreamingFilterProduction:
         except Exception:
             self._safe_stat_inc(drop_stat_key)
 
-    def _write_temp_wav(self, samples, path):
+    def _audio_window_to_wav_bytes(self, samples):
         pcm = np.clip(samples, -1.0, 1.0)
         pcm_i16 = (pcm * 32767).astype(np.int16)
-        with wave.open(path, 'wb') as wf:
+        buf = io.BytesIO()
+        with wave.open(buf, 'wb') as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
             wf.setframerate(self.audio_rate)
             wf.writeframes(pcm_i16.tobytes())
+        buf.seek(0)
+        return buf
+
+    def _recent_audio_window(self, seconds):
+        samples_needed = max(1, int(self.audio_rate * float(seconds)))
+        if len(self.audio_history) < 2:
+            return None, None, None
+
+        chunks = []
+        total = 0
+        start_ts = None
+        last_chunk = None
+        last_ts = None
+
+        for chunk, chunk_ts in reversed(self.audio_history):
+            if last_chunk is None:
+                last_chunk = chunk
+                last_ts = chunk_ts
+            chunks.append(chunk)
+            total += len(chunk)
+            start_ts = chunk_ts
+            if total >= samples_needed:
+                break
+
+        minimum_samples = max(self.audio_chunk * 2, samples_needed // 2)
+        if total < minimum_samples:
+            return None, None, None
+
+        window = np.concatenate(list(reversed(chunks)))
+        if len(window) > samples_needed:
+            trim = len(window) - samples_needed
+            window = window[-samples_needed:]
+            start_ts = float(start_ts) + (trim / float(self.audio_rate))
+
+        end_ts = float(last_ts) + (len(last_chunk) / float(self.audio_rate))
+        return window.copy(), float(start_ts), float(end_ts)
 
     def _schedule_live_stt_beep_events(self, now_mono):
         cfg = self.config
@@ -426,16 +464,12 @@ class StreamingFilterProduction:
             return
         if now_mono - self.last_stt_at < cfg.stt_poll_interval_s:
             return
-        if len(self.audio_history) < 2:
+        window, start_ts, _ = self._recent_audio_window(cfg.stt_window_s)
+        if window is None or window.size == 0:
             return
 
         self.last_stt_at = now_mono
-        start_ts = self.audio_history[0][1]
-        window = np.concatenate([a for a, _ in self.audio_history])
-        if window.size == 0:
-            return
-
-        payload = {'window': window.copy(), 'start_ts': start_ts}
+        payload = {'window': window, 'start_ts': start_ts}
         try:
             self.stt_queue.put_nowait(payload)
         except Exception:
@@ -452,34 +486,14 @@ class StreamingFilterProduction:
             return
         if now_mono - self.last_fast_gate_at < cfg.fast_gate_poll_interval_s:
             return
-        if len(self.audio_history) < 2:
+        window, window_start_ts, window_end_ts = self._recent_audio_window(cfg.fast_gate_window_s)
+        if window is None or window.size == 0:
             return
 
-        # Take only the most recent fast_gate_window_s of audio (and keep its audio-timeline timestamps).
-        samples_needed = int(self.audio_rate * cfg.fast_gate_window_s)
-        chunks = []
-        total = 0
-        window_start_ts = None
-        window_end_ts = None
-        # Walk newest -> oldest.
-        for a, a_ts in reversed(self.audio_history):
-            chunks.append(a)
-            total += len(a)
-            window_start_ts = a_ts
-            if total >= samples_needed:
-                break
-        if total < max(1, samples_needed // 2):
-            return
-
-        # End ts is the end of the most recent chunk we included.
-        last_chunk, last_ts = self.audio_history[-1]
-        window_end_ts = float(last_ts) + (len(last_chunk) / float(self.audio_rate))
-
-        window = np.concatenate(list(reversed(chunks)))[-samples_needed:]
         payload = {
-            'window': window.copy(),
-            'window_start_ts': float(window_start_ts) if window_start_ts is not None else float(self.audio_history[0][1]),
-            'window_end_ts': float(window_end_ts),
+            'window': window,
+            'window_start_ts': window_start_ts,
+            'window_end_ts': window_end_ts,
         }
         self.last_fast_gate_at = now_mono
         try:
@@ -504,9 +518,8 @@ class StreamingFilterProduction:
             window_start_ts = float(payload.get('window_start_ts', time.monotonic()))
             window_end_ts = float(payload.get('window_end_ts', window_start_ts))
             try:
-                # Use a dedicated temp wav path to avoid races with the STT thread.
-                self._write_temp_wav(window, cfg.fast_gate_temp_wav)
-                transcript = self.audio_transcriber.transcribe_text(cfg.fast_gate_temp_wav)
+                window_wav = self._audio_window_to_wav_bytes(window)
+                transcript = self.audio_transcriber.transcribe_text(window_wav)
                 text = (transcript.get('text', '') or '').strip()
                 self._safe_stat_inc('fast_gate_runs')
 
@@ -528,11 +541,7 @@ class StreamingFilterProduction:
             except Exception:
                 self._safe_stat_inc('runtime_errors')
             finally:
-                if os.path.exists(cfg.fast_gate_temp_wav):
-                    try:
-                        os.remove(cfg.fast_gate_temp_wav)
-                    except OSError:
-                        pass
+                pass
 
     def _kws_thread(self):
         """Streaming keyword spotting using Vosk partial results."""
@@ -623,9 +632,9 @@ class StreamingFilterProduction:
             window = payload['window']
             start_ts = payload['start_ts']
             try:
-                self._write_temp_wav(window, cfg.stt_temp_wav)
+                window_wav = self._audio_window_to_wav_bytes(window)
                 transcript = self.audio_transcriber.transcribe_with_timestamps(
-                    cfg.stt_temp_wav,
+                    window_wav,
                     vad_filter=bool(cfg.stt_vad_filter),
                     language=cfg.stt_language,
                 )
@@ -683,11 +692,7 @@ class StreamingFilterProduction:
             except Exception:
                 self._safe_stat_inc('runtime_errors')
             finally:
-                if os.path.exists(cfg.stt_temp_wav):
-                    try:
-                        os.remove(cfg.stt_temp_wav)
-                    except OSError:
-                        pass
+                pass
 
     def _apply_scheduled_beeps(self, audio_chunk, chunk_ts):
         with self.beep_lock:
@@ -1090,7 +1095,7 @@ def parse_args():
     parser.add_argument('--stt-alignment-delay-ms', type=float, default=FilterConfig.stt_alignment_delay_ms)
     parser.add_argument('--stt-vad-filter', action='store_true', help='Enable VAD filter (may miss short words)')
     parser.add_argument('--stt-language', default="en", help='Whisper language code (set empty for auto)')
-    parser.add_argument('--video-detection-interval', type=int, default=3)
+    parser.add_argument('--video-detection-interval', type=int, default=FilterConfig.video_detection_interval)
     parser.add_argument('--disable-fast-audio-gate', action='store_true')
     parser.add_argument('--fast-gate-window-s', type=float, default=FilterConfig.fast_gate_window_s)
     parser.add_argument('--fast-gate-poll-interval-s', type=float, default=FilterConfig.fast_gate_poll_interval_s)
