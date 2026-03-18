@@ -8,7 +8,9 @@ sentence-transformers
 better-profanity
 
 # Video / gesture / NSFW
-mediapipe<0.10.8
+# NOTE: Python 3.13 wheels are available for newer MediaPipe versions.
+# Gesture detection is optional; stream_filter/video pipeline runs without it.
+mediapipe>=0.10.30
 nudenet
 
 # STT + selective beep censoring

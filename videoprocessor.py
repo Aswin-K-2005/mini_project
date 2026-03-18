@@ -7,6 +7,9 @@ import cv2
 import numpy as np
 from collections import deque
 import time
+import os
+import urllib.request
+from dataclasses import dataclass
 
 try:
     from nudenet import NudeDetector
@@ -18,10 +21,22 @@ except ImportError:
 try:
     import mediapipe as mp
     MEDIAPIPE_AVAILABLE = True
-    print("✓ MediaPipe imported successfully")
+    print("[OK] MediaPipe imported successfully")
 except ImportError:
     MEDIAPIPE_AVAILABLE = False
-    print("⚠ MediaPipe not available - skipping gesture detection")
+    print("[WARN] MediaPipe not available - skipping gesture detection")
+
+
+@dataclass
+class _SimpleLandmark:
+    x: float
+    y: float
+    z: float = 0.0
+
+
+@dataclass
+class _SimpleHandLandmarks:
+    landmark: list
 
 
 class VideoProcessorTestComplete:
@@ -33,7 +48,7 @@ class VideoProcessorTestComplete:
     - Motion tracking
     """
     
-    def __init__(self, blur_mode='heavy'):
+    def __init__(self, blur_mode='heavy', hand_model_path: str | None = None):
         """
         blur_mode options:
         - 'pixelation': Fast pixelation (default for streaming)
@@ -41,10 +56,10 @@ class VideoProcessorTestComplete:
         - 'extreme': Triple-pass blur (maximum privacy)
         - 'black': Black boxes (complete censoring)
         """
-        print("\n🔧 Initializing Complete Video Processor...")
+        print("\n[INIT] Initializing Complete Video Processor...")
         
         self.blur_mode = blur_mode
-        print(f"✓ Blur mode: {blur_mode.upper()}")
+        print(f"[OK] Blur mode: {blur_mode.upper()}")
         
         # ══════════════════════════════════════════════════════════════════
         # NUDITY DETECTION (NudeNet preferred, face fallback)
@@ -55,9 +70,9 @@ class VideoProcessorTestComplete:
             try:
                 self.nude_detector = NudeDetector()
                 self.nudenet_available = True
-                print("✓ NudeNet detector loaded")
+                print("[OK] NudeNet detector loaded")
             except Exception as e:
-                print(f"⚠ NudeNet init failed: {e}. Using face fallback.")
+                print(f"[WARN] NudeNet init failed: {e}. Using face fallback.")
 
         self.face_cascade = cv2.CascadeClassifier(
             cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
@@ -65,19 +80,22 @@ class VideoProcessorTestComplete:
         if self.face_cascade.empty():
             raise Exception("ERROR: Could not load face cascade!")
         if not self.nudenet_available:
-            print("✓ Face detector fallback loaded")
+            print("[OK] Face detector fallback loaded")
         
         # ══════════════════════════════════════════════════════════════════
         # MEDIAPIPE HANDS - with version compatibility
         # ══════════════════════════════════════════════════════════════════
         self.hands = None
+        self.hands_api = None  # 'solutions' | 'tasks'
         self.hands_available = False
+        self.hand_landmarker = None
+        self.hand_model_path = hand_model_path or os.path.join(os.path.dirname(__file__), "hand_landmarker.task")
         
         if MEDIAPIPE_AVAILABLE:
             try:
                 # Try to access mp.solutions (old API)
                 if hasattr(mp, 'solutions'):
-                    print("✓ Using MediaPipe solutions API")
+                    print("[OK] Using MediaPipe solutions API")
                     mp_hands = mp.solutions.hands
                     self.hands = mp_hands.Hands(
                         static_image_mode=False,
@@ -87,13 +105,58 @@ class VideoProcessorTestComplete:
                     )
                     self.mp_drawing = mp.solutions.drawing_utils
                     self.hands_available = True
-                    print("✓ Hand tracking initialized (OLD API)")
+                    self.hands_api = 'solutions'
+                    print("[OK] Hand tracking initialized (solutions API)")
                 else:
-                    # New API structure
-                    print("⚠ MediaPipe new API detected - hand tracking disabled")
-                    print("  (Install mediapipe<0.10.8 for hand tracking support)")
+                    # New API structure: MediaPipe Tasks
+                    self._init_hand_landmarker_tasks()
             except Exception as e:
-                print(f"⚠ Hand tracking initialization failed: {e}")
+                print(f"[WARN] Hand tracking initialization failed: {e}")
+
+    def _ensure_hand_model(self):
+        if os.path.exists(self.hand_model_path):
+            return True
+        try:
+            os.makedirs(os.path.dirname(self.hand_model_path), exist_ok=True)
+        except Exception:
+            pass
+
+        url = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
+        try:
+            print(f"[INIT] Downloading hand model to: {self.hand_model_path}")
+            urllib.request.urlretrieve(url, self.hand_model_path)
+            return True
+        except Exception as e:
+            print(f"[WARN] Failed to download hand model: {e}")
+            return False
+
+    def _init_hand_landmarker_tasks(self):
+        try:
+            if not self._ensure_hand_model():
+                print("[WARN] Hand model missing; gesture detection disabled")
+                return
+
+            from mediapipe.tasks import python as mp_python  # type: ignore
+            from mediapipe.tasks.python import vision as mp_vision  # type: ignore
+
+            base_options = mp_python.BaseOptions(model_asset_path=self.hand_model_path)
+            options = mp_vision.HandLandmarkerOptions(
+                base_options=base_options,
+                running_mode=mp_vision.RunningMode.IMAGE,
+                num_hands=2,
+                min_hand_detection_confidence=0.5,
+                min_hand_presence_confidence=0.5,
+                min_tracking_confidence=0.5,
+            )
+            self.hand_landmarker = mp_vision.HandLandmarker.create_from_options(options)
+            self.hands_available = True
+            self.hands_api = 'tasks'
+            print("[OK] Hand tracking initialized (tasks API)")
+        except Exception as e:
+            print(f"[WARN] Tasks HandLandmarker init failed: {e}")
+            self.hand_landmarker = None
+            self.hands_available = False
+            self.hands_api = None
         
         # Gesture patterns
         self.offensive_gestures = {
@@ -129,7 +192,7 @@ class VideoProcessorTestComplete:
             'detection_mode': 'IDLE'
         }
         
-        print("✓ Initialization complete\n")
+        print("[OK] Initialization complete\n")
     
     # ══════════════════════════════════════════════════════════════════════
     # GESTURE DETECTION
@@ -236,40 +299,55 @@ class VideoProcessorTestComplete:
         """Detect hand gestures using MediaPipe"""
         if not self.hands_available:
             return []
-        
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = self.hands.process(rgb_frame)
-        
+
+        h, w, _ = frame.shape
         blur_regions = []
-        
-        if results.multi_hand_landmarks:
-            h, w, _ = frame.shape
-            
-            for hand_landmarks in results.multi_hand_landmarks:
-                # Check each gesture
-                for gesture_name, detect_func in self.offensive_gestures.items():
-                    if detect_func(hand_landmarks):
-                        # Get bounding box
-                        x_coords = [lm.x for lm in hand_landmarks.landmark]
-                        y_coords = [lm.y for lm in hand_landmarks.landmark]
-                        
-                        x_min = int(min(x_coords) * w)
-                        x_max = int(max(x_coords) * w)
-                        y_min = int(min(y_coords) * h)
-                        y_max = int(max(y_coords) * h)
-                        
-                        # Add generous padding for gestures
-                        padding = 40
-                        blur_regions.append({
-                            'x': max(0, x_min - padding),
-                            'y': max(0, y_min - padding),
-                            'width': min(w, x_max + padding) - max(0, x_min - padding),
-                            'height': min(h, y_max + padding) - max(0, y_min - padding),
-                            'type': gesture_name,
-                            'confidence': 1.0
-                        })
-                        self.stats['gestures_detected'] += 1
-        
+
+        hand_landmarks_list = []
+        if self.hands_api == 'solutions' and self.hands is not None:
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = self.hands.process(rgb_frame)
+            hand_landmarks_list = list(getattr(results, 'multi_hand_landmarks', []) or [])
+        elif self.hands_api == 'tasks' and self.hand_landmarker is not None:
+            try:
+                from mediapipe.tasks.python import vision as mp_vision  # type: ignore
+                from mediapipe import Image as MpImage, ImageFormat  # type: ignore
+
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                mp_image = MpImage(image_format=ImageFormat.SRGB, data=rgb)
+                det = self.hand_landmarker.detect(mp_image)
+                for hand in det.hand_landmarks or []:
+                    pts = [_SimpleLandmark(float(lm.x), float(lm.y), float(getattr(lm, 'z', 0.0))) for lm in hand]
+                    hand_landmarks_list.append(_SimpleHandLandmarks(landmark=pts))
+            except Exception:
+                return []
+        else:
+            return []
+
+        for hand_landmarks in hand_landmarks_list:
+            for gesture_name, detect_func in self.offensive_gestures.items():
+                if not detect_func(hand_landmarks):
+                    continue
+
+                x_coords = [lm.x for lm in hand_landmarks.landmark]
+                y_coords = [lm.y for lm in hand_landmarks.landmark]
+
+                x_min = int(min(x_coords) * w)
+                x_max = int(max(x_coords) * w)
+                y_min = int(min(y_coords) * h)
+                y_max = int(max(y_coords) * h)
+
+                padding = 40
+                blur_regions.append({
+                    'x': max(0, x_min - padding),
+                    'y': max(0, y_min - padding),
+                    'width': min(w, x_max + padding) - max(0, x_min - padding),
+                    'height': min(h, y_max + padding) - max(0, y_min - padding),
+                    'type': gesture_name,
+                    'confidence': 1.0
+                })
+                self.stats['gestures_detected'] += 1
+
         return blur_regions
     
     # ══════════════════════════════════════════════════════════════════════
@@ -461,8 +539,13 @@ class VideoProcessorTestComplete:
     
     def cleanup(self):
         """Cleanup"""
-        if self.hands_available and self.hands:
+        if self.hands_api == 'solutions' and self.hands:
             self.hands.close()
+        if self.hands_api == 'tasks' and self.hand_landmarker:
+            try:
+                self.hand_landmarker.close()
+            except Exception:
+                pass
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -489,10 +572,10 @@ if __name__ == "__main__":
     print(f"Using blur mode: {blur_mode.upper()}")
     print("=" * 70)
     print("\nTests:")
-    print("  ✓ NudeNet detection (face fallback if missing)")
-    print("  ✓ Hand gesture detection (MediaPipe)")
-    print("  ✓ Motion tracking")
-    print("  ✓ Frame skipping optimization")
+    print("  [OK] NudeNet detection (face fallback if missing)")
+    print("  [OK] Hand gesture detection (MediaPipe)")
+    print("  [OK] Motion tracking")
+    print("  [OK] Frame skipping optimization")
     print("\nControls:")
     print("  - Move your face fast to test tracking")
     print("  - Make a FIST or MIDDLE FINGER to test gestures")

@@ -15,7 +15,7 @@ try:
     PYDUB_AVAILABLE = True
 except ImportError:
     PYDUB_AVAILABLE = False
-    print("⚠ pydub not available - install: pip install pydub")
+                print("[WARN] pydub not available - install: pip install pydub")
 
 # Speech recognition
 try:
@@ -23,7 +23,7 @@ try:
     SPEECH_REC_AVAILABLE = True
 except ImportError:
     SPEECH_REC_AVAILABLE = False
-    print("⚠ speech_recognition not available - install: pip install SpeechRecognition")
+    print("[WARN] speech_recognition not available - install: pip install SpeechRecognition")
 
 # Import our advanced detector
 from audio_processor import AdvancedProfanityDetector
@@ -76,11 +76,11 @@ class AudioTester:
     def test_wav_file(self, filepath):
         """Test with a WAV audio file"""
         if not SPEECH_REC_AVAILABLE:
-            print("❌ speech_recognition not installed!")
+            print("[FAIL] speech_recognition not installed!")
             return
         
         if not os.path.exists(filepath):
-            print(f"❌ File not found: {filepath}")
+            print(f"[FAIL] File not found: {filepath}")
             return
         
         print(f"\n{'='*70}")
@@ -90,34 +90,34 @@ class AudioTester:
         try:
             # Load audio file
             with sr.AudioFile(filepath) as source:
-                print("🎵 Loading audio...")
+                print("[INIT] Loading audio...")
                 audio_data = self.recognizer.record(source)
             
             # Transcribe
-            print("🔄 Transcribing (this may take a few seconds)...")
+            print("[INIT] Transcribing (this may take a few seconds)...")
             text = self.recognizer.recognize_google(audio_data)
             
-            print(f"📝 Transcribed text: \"{text}\"")
+            print(f"[NOTE] Transcribed text: \"{text}\"")
             print()
             
             # Detect profanity
             is_profane, confidence, matches = self.detector.detect(text)
             
             if is_profane:
-                print(f"🚨 PROFANITY DETECTED!")
+                print(f"[ALERT] PROFANITY DETECTED!")
                 print(f"   Confidence: {confidence:.3f}")
                 print(f"   Matched terms: {[m['word'] for m in matches[:3]]}")
-                print("🔊 Playing BEEP...")
+                print("[INIT] Playing BEEP...")
                 self.play_beep()
             else:
-                print("✓ Clean - no profanity detected")
+                print("[OK] Clean - no profanity detected")
             
         except sr.UnknownValueError:
-            print("❌ Could not understand audio")
+            print("[FAIL] Could not understand audio")
         except sr.RequestError as e:
-            print(f"❌ Speech recognition error: {e}")
+            print(f"[FAIL] Speech recognition error: {e}")
         except Exception as e:
-            print(f"❌ Error: {e}")
+            print(f"[FAIL] Error: {e}")
     
     # ══════════════════════════════════════════════════════════════════════
     # METHOD 2: Test with MP3 file (convert to WAV first)
@@ -126,11 +126,11 @@ class AudioTester:
     def test_mp3_file(self, filepath):
         """Test with an MP3 file (converts to WAV first)"""
         if not PYDUB_AVAILABLE:
-            print("❌ pydub not installed! Install: pip install pydub")
+            print("[FAIL] pydub not installed! Install: pip install pydub")
             return
         
         if not os.path.exists(filepath):
-            print(f"❌ File not found: {filepath}")
+            print(f"[FAIL] File not found: {filepath}")
             return
         
         print(f"\n{'='*70}")
@@ -139,7 +139,7 @@ class AudioTester:
         
         try:
             # Convert MP3 to WAV
-            print("🔄 Converting MP3 to WAV...")
+            print("[INIT] Converting MP3 to WAV...")
             audio = AudioSegment.from_mp3(filepath)
             
             # Export to temporary WAV
@@ -154,7 +154,7 @@ class AudioTester:
                 os.remove(temp_wav)
             
         except Exception as e:
-            print(f"❌ Error processing MP3: {e}")
+            print(f"[FAIL] Error processing MP3: {e}")
     
     # ══════════════════════════════════════════════════════════════════════
     # METHOD 3: Test with live microphone
@@ -163,14 +163,14 @@ class AudioTester:
     def test_microphone(self, duration=5):
         """Record from microphone and test"""
         if not SPEECH_REC_AVAILABLE:
-            print("❌ speech_recognition not installed!")
+            print("[FAIL] speech_recognition not installed!")
             return
         
         print(f"\n{'='*70}")
         print(f"LIVE MICROPHONE TEST")
         print(f"{'='*70}")
         print(f"Recording for {duration} seconds...")
-        print("🎤 Start speaking NOW!\n")
+        print("[MIC] Start speaking NOW!\n")
         
         try:
             with sr.Microphone() as source:
@@ -178,39 +178,39 @@ class AudioTester:
                 print("🔇 Adjusting for ambient noise... (be quiet)")
                 self.recognizer.adjust_for_ambient_noise(source, duration=1)
                 
-                print(f"🎤 Recording {duration} seconds... SPEAK NOW!")
+                print(f"[MIC] Recording {duration} seconds... SPEAK NOW!")
                 audio_data = self.recognizer.listen(source, timeout=duration, phrase_time_limit=duration)
             
-            print("✓ Recording complete!")
-            print("🔄 Transcribing...")
+            print("[OK] Recording complete!")
+            print("[INIT] Transcribing...")
             
             # Transcribe
             text = self.recognizer.recognize_google(audio_data)
-            print(f"\n📝 You said: \"{text}\"")
+            print(f"\n[NOTE] You said: \"{text}\"")
             print()
             
             # Detect profanity
             is_profane, confidence, matches = self.detector.detect(text)
             
             if is_profane:
-                print(f"🚨 PROFANITY DETECTED!")
+                print(f"[ALERT] PROFANITY DETECTED!")
                 print(f"   Confidence: {confidence:.3f}")
                 print(f"   Matched terms: {[m['word'] for m in matches[:3]]}")
-                print("🔊 Playing BEEP...")
+                print("[INIT] Playing BEEP...")
                 self.play_beep()
             else:
-                print("✓ Clean - no profanity detected")
+                print("[OK] Clean - no profanity detected")
             
             return text, is_profane, confidence
             
         except sr.WaitTimeoutError:
-            print("❌ No speech detected in time limit")
+            print("[FAIL] No speech detected in time limit")
         except sr.UnknownValueError:
-            print("❌ Could not understand audio")
+            print("[FAIL] Could not understand audio")
         except sr.RequestError as e:
-            print(f"❌ Speech recognition error: {e}")
+            print(f"[FAIL] Speech recognition error: {e}")
         except Exception as e:
-            print(f"❌ Error: {e}")
+            print(f"[FAIL] Error: {e}")
         
         return None, False, 0.0
     
@@ -224,7 +224,7 @@ class AudioTester:
         Press Ctrl+C to stop
         """
         if not SPEECH_REC_AVAILABLE:
-            print("❌ speech_recognition not installed!")
+            print("[FAIL] speech_recognition not installed!")
             return
         
         print(f"\n{'='*70}")
@@ -239,7 +239,7 @@ class AudioTester:
             print("🔇 Adjusting for ambient noise...")
             self.recognizer.adjust_for_ambient_noise(source, duration=1)
             
-            print("\n🎤 Monitoring started! Speak naturally...\n")
+            print("\n[MIC] Monitoring started! Speak naturally...\n")
             
             try:
                 while True:
@@ -256,22 +256,22 @@ class AudioTester:
                             is_profane, confidence, matches = self.detector.detect(text)
                             
                             if is_profane:
-                                print(f"  🚨 PROFANE (conf: {confidence:.2f}) - {[m['word'] for m in matches[:2]]}")
+                                print(f"  [ALERT] PROFANE (conf: {confidence:.2f}) - {[m['word'] for m in matches[:2]]}")
                                 self.play_beep()
                             else:
-                                print(f"  ✓ Clean")
+                                print(f"  [OK] Clean")
                             print()
                             
                         except sr.UnknownValueError:
                             pass  # Couldn't understand, skip
                         except sr.RequestError as e:
-                            print(f"  ❌ API error: {e}")
+                            print(f"  [FAIL] API error: {e}")
                     
                     except sr.WaitTimeoutError:
                         pass  # No speech, continue listening
                     
             except KeyboardInterrupt:
-                print("\n\n✓ Monitoring stopped")
+                print("\n\n[OK] Monitoring stopped")
     
     def cleanup(self):
         """Cleanup resources"""
@@ -288,7 +288,7 @@ def main():
     print("="*70)
     
     if not SPEECH_REC_AVAILABLE:
-        print("\n❌ speech_recognition not installed!")
+        print("\n[FAIL] speech_recognition not installed!")
         print("Install it: pip install SpeechRecognition")
         return
     
@@ -315,7 +315,7 @@ def main():
         
         elif choice == '2':
             if not PYDUB_AVAILABLE:
-                print("❌ pydub not installed! Install: pip install pydub")
+                print("[FAIL] pydub not installed! Install: pip install pydub")
             else:
                 filepath = input("Enter MP3 file path: ").strip()
                 tester.test_mp3_file(filepath)
@@ -339,7 +339,7 @@ def main():
             print("Invalid option")
     
     tester.cleanup()
-    print("\n✓ Tests complete!")
+    print("\n[OK] Tests complete!")
 
 
 # ══════════════════════════════════════════════════════════════════════════

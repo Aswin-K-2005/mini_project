@@ -20,6 +20,12 @@ from audio_processor import AdvancedProfanityDetector, AudioTranscriber
 from videoprocessor import VideoProcessorTestComplete
 
 try:
+    from vosk import Model as VoskModel, KaldiRecognizer as VoskRecognizer
+    VOSK_AVAILABLE = True
+except ImportError:
+    VOSK_AVAILABLE = False
+
+try:
     import pyvirtualcam
     VIRTUAL_CAM_AVAILABLE = True
 except ImportError:
@@ -31,8 +37,9 @@ class FilterConfig:
     blur_mode: str = 'pixelation'
     recall_mode: str = 'high'
     video_source: int = 0
-    target_latency_ms: float = 150.0
-    max_latency_ms: float = 230.0
+    # Defaults tuned for STT word-level censoring reliability.
+    target_latency_ms: float = 950.0
+    max_latency_ms: float = 1400.0
     sync_tolerance_ms: float = 40.0
     use_virtual_cam: bool = False
     virtual_cam_device: str = 'NeonGuard Virtual Camera'
@@ -40,13 +47,30 @@ class FilterConfig:
     health_log_path: str = 'runtime_health.jsonl'
     health_log_interval_s: float = 5.0
     enable_live_stt_censor: bool = True
-    stt_model_size: str = 'tiny'
-    stt_window_s: float = 2.0
-    stt_poll_interval_s: float = 1.2
+    # 'base' is much more reliable for short profane words than 'tiny'.
+    stt_model_size: str = 'base'
+    # Smaller window + faster polling helps reduce "wait for sentence end".
+    stt_window_s: float = 1.2
+    stt_poll_interval_s: float = 0.5
     stt_temp_wav: str = 'live_stt_window.wav'
     stt_force_keyword_fallback: bool = True
-    stt_alignment_delay_ms: float = 350.0
+    stt_vad_filter: bool = False
+    stt_language: str | None = "en"
+    # Extra hold so STT results arrive before playback.
+    stt_alignment_delay_ms: float = 750.0
     video_detection_interval: int = 3
+    enable_fast_audio_gate: bool = True
+    # Lightweight safety net (still uses STT, but no word timestamps): forces an immediate beep.
+    fast_gate_window_s: float = 0.8
+    fast_gate_poll_interval_s: float = 0.2
+    fast_gate_beep_ms: float = 420.0
+    fast_gate_cooldown_ms: float = 450.0
+    fast_gate_temp_wav: str = 'fast_gate_window.wav'
+    enable_kws: bool = False
+    kws_model_path: str = "vosk-model-small-en-us-0.15"
+    kws_cooldown_ms: float = 500.0
+    kws_beep_ms: float = 320.0
+    audio_timeline_seconds: float = 6.0
 
 
 @dataclass
@@ -145,6 +169,94 @@ class AudioDelayBuffer:
             self.buffer.popleft()
 
 
+class AudioTimelineBuffer:
+    """
+    Stores audio chunks on the capture timestamp timeline and allows in-place overlays
+    (beeps) before playback. This enables clean "replace bad word then play" behavior.
+    """
+
+    def __init__(self, sample_rate: int, max_seconds: float):
+        self.sample_rate = int(sample_rate)
+        self.max_seconds = float(max_seconds)
+        self._chunks = deque()  # each item: {'ts': float, 'audio': np.ndarray(float32)}
+        self._lock = threading.Lock()
+
+    def add_chunk(self, audio: np.ndarray, ts: float):
+        audio = audio.astype(np.float32, copy=False)
+        if audio.ndim != 1:
+            audio = audio.reshape(-1)
+        with self._lock:
+            self._chunks.append({'ts': float(ts), 'audio': audio.copy()})
+            self._trim_locked()
+
+    def overlay_beep(self, ev_start: float, ev_end: float, beep_wave: np.ndarray):
+        if ev_end <= ev_start:
+            return
+        with self._lock:
+            if not self._chunks:
+                return
+            for ch in self._chunks:
+                ts0 = ch['ts']
+                a = ch['audio']
+                ts1 = ts0 + (len(a) / float(self.sample_rate))
+                overlap_start = max(ts0, float(ev_start))
+                overlap_end = min(ts1, float(ev_end))
+                if overlap_end <= overlap_start:
+                    continue
+                i0 = int((overlap_start - ts0) * self.sample_rate)
+                i1 = int((overlap_end - ts0) * self.sample_rate)
+                i0 = max(0, min(i0, len(a)))
+                i1 = max(0, min(i1, len(a)))
+                if i1 <= i0:
+                    continue
+                seg_len = i1 - i0
+                a[i0:i1] = beep_wave[:seg_len] if seg_len <= len(beep_wave) else np.resize(beep_wave, seg_len)
+
+    def get_chunk(self, ts: float, n_samples: int) -> np.ndarray:
+        ts = float(ts)
+        n_samples = int(n_samples)
+        if n_samples <= 0:
+            return np.zeros(0, dtype=np.float32)
+
+        out = np.zeros(n_samples, dtype=np.float32)
+        with self._lock:
+            if not self._chunks:
+                return out
+            req_end = ts + (n_samples / float(self.sample_rate))
+            for ch in self._chunks:
+                ts0 = ch['ts']
+                a = ch['audio']
+                ts1 = ts0 + (len(a) / float(self.sample_rate))
+                overlap_start = max(ts0, ts)
+                overlap_end = min(ts1, req_end)
+                if overlap_end <= overlap_start:
+                    continue
+                src_i0 = int((overlap_start - ts0) * self.sample_rate)
+                src_i1 = int((overlap_end - ts0) * self.sample_rate)
+                dst_i0 = int((overlap_start - ts) * self.sample_rate)
+                dst_i1 = dst_i0 + (src_i1 - src_i0)
+                src_i0 = max(0, min(src_i0, len(a)))
+                src_i1 = max(0, min(src_i1, len(a)))
+                dst_i0 = max(0, min(dst_i0, len(out)))
+                dst_i1 = max(0, min(dst_i1, len(out)))
+                if dst_i1 > dst_i0 and src_i1 > src_i0:
+                    out[dst_i0:dst_i1] = a[src_i0:src_i1]
+            return out
+
+    def _trim_locked(self):
+        if not self._chunks:
+            return
+        newest = self._chunks[-1]
+        newest_end = newest['ts'] + (len(newest['audio']) / float(self.sample_rate))
+        keep_after = newest_end - self.max_seconds
+        while self._chunks:
+            ch = self._chunks[0]
+            ch_end = ch['ts'] + (len(ch['audio']) / float(self.sample_rate))
+            if ch_end >= keep_after:
+                break
+            self._chunks.popleft()
+
+
 class StreamingFilterProduction:
     def __init__(self, config: FilterConfig):
         self.config = config
@@ -157,21 +269,37 @@ class StreamingFilterProduction:
             allow_mild_profanity=False,
         )
         self.audio_transcriber = AudioTranscriber(model_size=config.stt_model_size)
+        self.last_fast_gate_at = 0.0
+        self.fast_gate_queue = Queue(maxsize=1)
+        self.fast_gate_beep_until = 0.0
+        self.kws_audio_queue = Queue(maxsize=10)
+        self.kws_model = None
+        self.kws_recognizer = None
+        self.kws_last_fire_ms = 0.0
 
         self.video_capture = cv2.VideoCapture(config.video_source, cv2.CAP_DSHOW)
         self.video_capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         self.video_capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         self.video_capture.set(cv2.CAP_PROP_FPS, 30)
 
-        self.audio_format = pyaudio.paFloat32
+        # Use int16 for output stability/compatibility; keep internal as float32 (-1..1).
+        self.audio_in_format = pyaudio.paInt16
+        self.audio_out_format = pyaudio.paInt16
         self.audio_channels = 1
         self.audio_rate = 44100
-        self.audio_chunk = 1024
+        # Align audio chunks with video cadence (~30fps) to reduce A/V pairing jitter.
+        self.target_fps = 30.0
+        self.audio_chunk = int(round(self.audio_rate / self.target_fps))  # ~1470 samples
         self.pyaudio = pyaudio.PyAudio()
 
+        # Keep total end-to-end latency near target by budgeting audio delay below target.
+        # Video frames are held to enforce the final constant latency.
+        audio_budget_ms = max(0.0, float(config.target_latency_ms) - float(config.stt_alignment_delay_ms))
+        audio_min_ms = max(10.0, audio_budget_ms * 0.75)
+        audio_max_ms = max(audio_min_ms, audio_budget_ms * 1.25)
         self.audio_delay = AudioDelayBuffer(
-            min_delay_ms=max(40.0, config.target_latency_ms * 0.35),
-            max_delay_ms=min(config.max_latency_ms, config.target_latency_ms * 1.1),
+            min_delay_ms=audio_min_ms,
+            max_delay_ms=min(config.max_latency_ms, audio_max_ms),
         )
 
         self.video_queue = Queue(maxsize=24)
@@ -210,9 +338,33 @@ class StreamingFilterProduction:
             'profanity_events': 0,
             'live_stt_runs': 0,
             'live_stt_profanity_hits': 0,
+            'fast_gate_runs': 0,
+            'fast_gate_hits': 0,
+            'kws_runs': 0,
+            'kws_hits': 0,
             'runtime_errors': 0,
             'started_at': time.time(),
         }
+
+        if self.config.enable_kws and VOSK_AVAILABLE:
+            try:
+                if os.path.isdir(self.config.kws_model_path):
+                    self.kws_model = VoskModel(self.config.kws_model_path)
+                    self.kws_recognizer = VoskRecognizer(self.kws_model, self.audio_rate)
+                    # We only need text; keep words off for speed.
+                    try:
+                        self.kws_recognizer.SetWords(False)
+                    except Exception:
+                        pass
+                    print("[OK] Vosk keyword spotting enabled")
+                else:
+                    print(f"[WARN] Vosk model folder not found: {self.config.kws_model_path}")
+            except Exception as e:
+                print(f"[WARN] Failed to init Vosk KWS: {e}")
+                self.kws_model = None
+                self.kws_recognizer = None
+        elif self.config.enable_kws and (not VOSK_AVAILABLE):
+            print("[WARN] Vosk not installed; KWS disabled (pip install vosk)")
 
     @staticmethod
     def list_audio_devices():
@@ -294,6 +446,149 @@ class StreamingFilterProduction:
             except Exception:
                 pass
 
+    def _schedule_fast_gate(self, now_mono):
+        cfg = self.config
+        if not cfg.enable_fast_audio_gate or not self.audio_transcriber.available:
+            return
+        if now_mono - self.last_fast_gate_at < cfg.fast_gate_poll_interval_s:
+            return
+        if len(self.audio_history) < 2:
+            return
+
+        # Take only the most recent fast_gate_window_s of audio (and keep its audio-timeline timestamps).
+        samples_needed = int(self.audio_rate * cfg.fast_gate_window_s)
+        chunks = []
+        total = 0
+        window_start_ts = None
+        window_end_ts = None
+        # Walk newest -> oldest.
+        for a, a_ts in reversed(self.audio_history):
+            chunks.append(a)
+            total += len(a)
+            window_start_ts = a_ts
+            if total >= samples_needed:
+                break
+        if total < max(1, samples_needed // 2):
+            return
+
+        # End ts is the end of the most recent chunk we included.
+        last_chunk, last_ts = self.audio_history[-1]
+        window_end_ts = float(last_ts) + (len(last_chunk) / float(self.audio_rate))
+
+        window = np.concatenate(list(reversed(chunks)))[-samples_needed:]
+        payload = {
+            'window': window.copy(),
+            'window_start_ts': float(window_start_ts) if window_start_ts is not None else float(self.audio_history[0][1]),
+            'window_end_ts': float(window_end_ts),
+        }
+        self.last_fast_gate_at = now_mono
+        try:
+            self.fast_gate_queue.put_nowait(payload)
+        except Exception:
+            # drop older pending work; keep latest
+            try:
+                self.fast_gate_queue.get_nowait()
+                self.fast_gate_queue.put_nowait(payload)
+            except Exception:
+                pass
+
+    def _fast_gate_thread(self):
+        cfg = self.config
+        while not self.stop_event.is_set():
+            try:
+                payload = self.fast_gate_queue.get(timeout=0.2)
+            except Empty:
+                continue
+
+            window = payload['window']
+            window_start_ts = float(payload.get('window_start_ts', time.monotonic()))
+            window_end_ts = float(payload.get('window_end_ts', window_start_ts))
+            try:
+                # Use a dedicated temp wav path to avoid races with the STT thread.
+                self._write_temp_wav(window, cfg.fast_gate_temp_wav)
+                transcript = self.audio_transcriber.transcribe_text(cfg.fast_gate_temp_wav)
+                text = (transcript.get('text', '') or '').strip()
+                self._safe_stat_inc('fast_gate_runs')
+
+                is_profane, _, _ = self.audio_detector.detect(text)
+                if (not is_profane) and cfg.stt_force_keyword_fallback:
+                    is_profane = self._segment_is_profane_fast(text)
+
+                if is_profane:
+                    # Cooldown to avoid constant beeping on long speech.
+                    now_ms = time.monotonic() * 1000.0
+                    if now_ms < self.fast_gate_beep_until + cfg.fast_gate_cooldown_ms:
+                        continue
+                    dur_s = float(cfg.fast_gate_beep_ms) / 1000.0
+                    # Low-latency path: force-beep upcoming playback immediately.
+                    # This avoids timing/overlap issues with scheduled events at low latency.
+                    self.beep_until = max(self.beep_until, time.monotonic() + dur_s)
+                    self.fast_gate_beep_until = now_ms
+                    self._safe_stat_inc('fast_gate_hits')
+            except Exception:
+                self._safe_stat_inc('runtime_errors')
+            finally:
+                if os.path.exists(cfg.fast_gate_temp_wav):
+                    try:
+                        os.remove(cfg.fast_gate_temp_wav)
+                    except OSError:
+                        pass
+
+    def _kws_thread(self):
+        """Streaming keyword spotting using Vosk partial results."""
+        if not (self.config.enable_kws and self.kws_recognizer is not None):
+            return
+
+        while not self.stop_event.is_set():
+            try:
+                chunk_bytes, chunk_ts = self.kws_audio_queue.get(timeout=0.2)
+            except Empty:
+                continue
+
+            try:
+                # Feed audio to recognizer
+                self._safe_stat_inc('kws_runs')
+                _accepted = self.kws_recognizer.AcceptWaveform(chunk_bytes)
+
+                # Prefer partial for low latency, but also check final.
+                partial = ''
+                try:
+                    payload = json.loads(self.kws_recognizer.PartialResult() or '{}')
+                    partial = (payload.get('partial') or '').strip()
+                except Exception:
+                    partial = ''
+
+                final_text = ''
+                if _accepted:
+                    try:
+                        payload = json.loads(self.kws_recognizer.Result() or '{}')
+                        final_text = (payload.get('text') or '').strip()
+                    except Exception:
+                        final_text = ''
+
+                text = (partial or final_text).strip()
+                if not text:
+                    continue
+
+                # Very fast check: severe words + phonetic fallback
+                is_profane, _, _ = self.audio_detector.detect(text)
+                if (not is_profane) and self.config.stt_force_keyword_fallback:
+                    is_profane = self._segment_is_profane_fast(text)
+                if not is_profane:
+                    continue
+
+                now_ms = time.monotonic() * 1000.0
+                if now_ms - self.kws_last_fire_ms < float(self.config.kws_cooldown_ms):
+                    continue
+
+                dur_s = float(self.config.kws_beep_ms) / 1000.0
+                with self.beep_lock:
+                    self.beep_events.append((chunk_ts, chunk_ts + dur_s))
+                self.kws_last_fire_ms = now_ms
+                self._safe_stat_inc('kws_hits')
+            except Exception:
+                self._safe_stat_inc('runtime_errors')
+
 
     def _segment_is_profane_fast(self, text):
         """Aggressive fallback for live stream: keyword + phonetic checks."""
@@ -329,11 +624,19 @@ class StreamingFilterProduction:
             start_ts = payload['start_ts']
             try:
                 self._write_temp_wav(window, cfg.stt_temp_wav)
-                transcript = self.audio_transcriber.transcribe_with_timestamps(cfg.stt_temp_wav)
+                transcript = self.audio_transcriber.transcribe_with_timestamps(
+                    cfg.stt_temp_wav,
+                    vad_filter=bool(cfg.stt_vad_filter),
+                    language=cfg.stt_language,
+                )
                 result = self.audio_detector.censor_transcript(transcript)
                 self._safe_stat_inc('live_stt_runs')
                 hit_count = 0
-                now_cutoff = time.monotonic() - 1.0
+                # IMPORTANT: we HOLD audio before playback (stt_alignment_delay_ms).
+                # So we must keep events that may be up to that hold duration "in the past",
+                # otherwise we discard the exact word timings we wanted to beep.
+                hold_s = float(cfg.stt_alignment_delay_ms) / 1000.0
+                now_cutoff = time.monotonic() - (hold_s + 0.35)
 
                 raw_segments = transcript.get('segments', [])
                 censored_segments = result.get('segments', [])
@@ -445,7 +748,7 @@ class StreamingFilterProduction:
 
     def _audio_thread(self):
         stream_in = self.pyaudio.open(
-            format=self.audio_format,
+            format=self.audio_in_format,
             channels=self.audio_channels,
             rate=self.audio_rate,
             input=True,
@@ -454,8 +757,16 @@ class StreamingFilterProduction:
         try:
             while not self.stop_event.is_set():
                 data = stream_in.read(self.audio_chunk, exception_on_overflow=False)
-                audio = np.frombuffer(data, dtype=np.float32)
+                audio_i16 = np.frombuffer(data, dtype=np.int16)
+                audio = (audio_i16.astype(np.float32) / 32768.0).clip(-1.0, 1.0)
                 ts = time.monotonic()
+
+                # Feed raw int16 bytes to streaming KWS (Vosk) if enabled.
+                if self.config.enable_kws and self.kws_recognizer is not None:
+                    try:
+                        self.kws_audio_queue.put_nowait((data, ts))
+                    except Exception:
+                        pass
 
                 self.audio_delay.add(audio, ts)
                 self.audio_delay.trim_older_than(self.config.max_latency_ms)
@@ -466,16 +777,15 @@ class StreamingFilterProduction:
                     continue
 
                 delayed_audio, delayed_ts = ready
+                # Keep a clean copy for STT; do NOT apply beeps yet.
+                # Beeps are applied right before playback (after the hold),
+                # so STT results that arrive during the hold can affect this chunk.
                 self.audio_history.append((delayed_audio.copy(), delayed_ts))
-                self._schedule_live_stt_beep_events(time.monotonic())
+                now_mono = time.monotonic()
+                self._schedule_live_stt_beep_events(now_mono)
+                self._schedule_fast_gate(now_mono)
 
-                # manual beep trigger fallback
-                if time.monotonic() < self.beep_until:
-                    n = min(len(delayed_audio), len(self.beep_sound))
-                    delayed_audio = delayed_audio.copy()
-                    delayed_audio[:n] = self.beep_sound[:n]
-
-                delayed_audio = self._apply_scheduled_beeps(delayed_audio, delayed_ts)
+                # Enqueue raw audio first; apply beeps later (after hold).
                 packet = {'audio': delayed_audio, 'ts': delayed_ts}
                 self.latest_audio_packet = packet
 
@@ -484,33 +794,75 @@ class StreamingFilterProduction:
                 hold_s = self.config.stt_alignment_delay_ms / 1000.0
                 now_mono = time.monotonic()
                 while self.pending_audio and (now_mono - self.pending_audio[0]['ts']) >= hold_s:
-                    self._bounded_put(self.audio_queue, self.pending_audio.popleft(), 'drops_audio_queue')
+                    pkt = self.pending_audio.popleft()
+                    out_audio = pkt['audio']
+
+                    # manual beep trigger fallback (hotkey 'b')
+                    if time.monotonic() < self.beep_until:
+                        n = min(len(out_audio), len(self.beep_sound))
+                        out_audio = out_audio.copy()
+                        out_audio[:n] = self.beep_sound[:n]
+
+                    # Apply scheduled STT beeps as late as possible so events can land on time.
+                    out_audio = self._apply_scheduled_beeps(out_audio, pkt['ts'])
+                    self._bounded_put(self.audio_queue, {'audio': out_audio, 'ts': pkt['ts']}, 'drops_audio_queue')
         finally:
             while self.pending_audio:
-                self._bounded_put(self.audio_queue, self.pending_audio.popleft(), 'drops_audio_queue')
+                pkt = self.pending_audio.popleft()
+                out_audio = self._apply_scheduled_beeps(pkt['audio'], pkt['ts'])
+                self._bounded_put(self.audio_queue, {'audio': out_audio, 'ts': pkt['ts']}, 'drops_audio_queue')
             stream_in.stop_stream()
             stream_in.close()
 
     def _sync_thread(self):
+        # Buffer video frames and only release them once they've aged to the desired
+        # end-to-end latency. This ensures the viewer sees stable, constant delay.
+        video_hold = deque()
+
         while not self.stop_event.is_set():
             try:
-                video_pkt = self.video_queue.get(timeout=0.1)
+                video_hold.append(self.video_queue.get(timeout=0.1))
             except Empty:
+                pass
+
+            if not video_hold:
                 continue
 
+            now_mono = time.monotonic()
+            v_ts = video_hold[0]['ts']
+            age_ms = (now_mono - v_ts) * 1000.0
+            if age_ms < self.config.target_latency_ms:
+                # Not old enough yet; keep buffering.
+                time.sleep(0.001)
+                continue
+
+            # Drop extremely stale frames to avoid unbounded buffering.
+            if age_ms > self.config.max_latency_ms:
+                video_hold.popleft()
+                self._safe_stat_inc('drops_stale')
+                continue
+
+            video_pkt = video_hold.popleft()
             v_ts = video_pkt['ts']
+
+            e2e_ms = (time.monotonic() - v_ts) * 1000.0
+            self._safe_stat_set('sync_offset_ms', 0.0)
+            self._safe_stat_set('end_to_end_ms', e2e_ms)
+
+            if e2e_ms > self.config.max_latency_ms:
+                self._safe_stat_inc('drops_stale')
+                continue
+
             matched_audio = None
             best_diff_ms = float('inf')
-            for _ in range(8):
+
+            for _ in range(12):
                 try:
                     self.audio_sync_cache.append(self.audio_queue.get_nowait())
                 except Empty:
                     break
 
-            # Audio timestamps are intentionally delayed; match against expected delayed timestamp.
-            expected_audio_ts = v_ts - ((self.audio_delay.target_delay_ms + self.config.stt_alignment_delay_ms) / 1000.0)
-
-            # Trim stale cached audio to bound memory and avoid bad matches.
+            expected_audio_ts = v_ts
             cache_ttl_s = self.config.max_latency_ms / 1000.0
             while self.audio_sync_cache and self.audio_sync_cache[0]['ts'] < expected_audio_ts - cache_ttl_s:
                 self.audio_sync_cache.popleft()
@@ -525,7 +877,6 @@ class StreamingFilterProduction:
 
             if matched_audio is None or best_diff_ms > self.config.sync_tolerance_ms:
                 self._safe_stat_inc('sync_drops')
-                # keep output audible: reuse latest processed audio when sync misses
                 fallback = self.latest_audio_packet
                 if fallback is not None:
                     pkt = AVPacket(video_pkt['frame'], fallback['audio'], v_ts, video_pkt.get('metadata', {}))
@@ -535,18 +886,10 @@ class StreamingFilterProduction:
                 self._bounded_put(self.output_queue, pkt, 'drops_stale')
                 continue
 
-            # Remove used audio packet from cache
             if best_idx is not None:
                 del self.audio_sync_cache[best_idx]
 
-            e2e_ms = (time.monotonic() - v_ts) * 1000.0
             self._safe_stat_set('sync_offset_ms', best_diff_ms)
-            self._safe_stat_set('end_to_end_ms', e2e_ms)
-
-            if e2e_ms > self.config.max_latency_ms:
-                self._safe_stat_inc('drops_stale')
-                continue
-
             pkt = AVPacket(video_pkt['frame'], matched_audio['audio'], v_ts, video_pkt.get('metadata', {}))
             self._bounded_put(self.output_queue, pkt, 'drops_stale')
 
@@ -563,22 +906,24 @@ class StreamingFilterProduction:
 
     def _output_thread(self):
         kwargs = dict(
-            format=self.audio_format,
+            format=self.audio_out_format,
             channels=self.audio_channels,
             rate=self.audio_rate,
             output=True,
-            frames_per_buffer=self.audio_chunk,
+            # Give PortAudio a bit more buffering to reduce stutter on Windows.
+            frames_per_buffer=self.audio_chunk * 4,
         )
         if self.config.audio_output_device_index is not None:
             kwargs['output_device_index'] = self.config.audio_output_device_index
 
         audio_out = self.pyaudio.open(**kwargs)
-        cv2.namedWindow('Production Streaming Filter', cv2.WINDOW_NORMAL)
+        window_name = 'Production Streaming Filter'
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
         virtual_cam = None
 
         if self.use_virtual_cam:
             if not VIRTUAL_CAM_AVAILABLE:
-                print('⚠ pyvirtualcam not installed; virtual cam disabled.')
+                print('[WARN] pyvirtualcam not installed; virtual cam disabled.')
             else:
                 virtual_cam = pyvirtualcam.Camera(
                     width=1280,
@@ -586,36 +931,40 @@ class StreamingFilterProduction:
                     fps=30,
                     device=self.config.virtual_cam_device,
                 )
-                print(f'✓ Virtual camera active: {virtual_cam.device}')
+                print(f'[OK] Virtual camera active: {virtual_cam.device}')
 
         fps_count = 0
         start = time.monotonic()
+        silence_i16 = (np.zeros(self.audio_chunk, dtype=np.int16)).tobytes()
+        blank_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
         try:
             while not self.stop_event.is_set():
                 try:
                     pkt = self.output_queue.get(timeout=0.1)
                 except Empty:
+                    # Keep audio continuous even if video/sync stalls.
+                    audio_out.write(silence_i16, exception_on_underflow=False)
+                    # Pump the UI so the window stays responsive and visible.
+                    frame = blank_frame.copy()
+                    self._draw_stats_overlay(frame)
+                    cv2.putText(frame, "Waiting for A/V packets...", (18, 340), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2, cv2.LINE_AA)
+                    cv2.imshow(window_name, frame)
+                    cv2.waitKey(1)
                     continue
+
+                # Write audio first to avoid UI/camera pacing starving audio.
+                audio_chunk = np.clip(pkt.audio.astype(np.float32), -1.0, 1.0)
+                audio_i16 = (audio_chunk * 32767.0).astype(np.int16)
+                audio_out.write(audio_i16.tobytes(), exception_on_underflow=False)
+                self.last_audio_write_ts = time.monotonic()
 
                 frame = pkt.frame.copy()
                 self._draw_stats_overlay(frame)
-                cv2.imshow('Production Streaming Filter', frame)
+                cv2.imshow(window_name, frame)
 
                 if virtual_cam is not None:
                     virtual_cam.send(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                    virtual_cam.sleep_until_next_frame()
-
-                audio_chunk = pkt.audio.astype(np.float32)
-                now_ts = time.monotonic()
-                elapsed = max(0.0, now_ts - self.last_audio_write_ts)
-                chunk_duration = len(audio_chunk) / float(self.audio_rate)
-                repeats = 1
-                if chunk_duration > 0:
-                    repeats = max(1, int(round(elapsed / chunk_duration)))
-                    repeats = min(repeats, 3)
-                for _ in range(repeats):
-                    audio_out.write(audio_chunk.tobytes(), exception_on_underflow=False)
-                self.last_audio_write_ts = now_ts
+                    # Avoid blocking sleep here; it can starve audio and cause stutter.
 
                 fps_count += 1
                 self._safe_stat_inc('frames_output')
@@ -650,6 +999,8 @@ class StreamingFilterProduction:
             f"Dropped stale: {s['drops_stale']} | Sync drops: {s['sync_drops']}",
             f"Queue drops V/A: {s['drops_video_queue']}/{s['drops_audio_queue']}",
             f"Live STT runs/hits: {s['live_stt_runs']}/{s['live_stt_profanity_hits']}",
+            f"Fast gate runs/hits: {s.get('fast_gate_runs', 0)}/{s.get('fast_gate_hits', 0)}",
+            f"KWS runs/hits: {s.get('kws_runs', 0)}/{s.get('kws_hits', 0)}",
             "Press 'b' test beep | 'q' quit",
         ]
         for i, line in enumerate(lines):
@@ -675,6 +1026,8 @@ class StreamingFilterProduction:
             threading.Thread(target=self._video_thread, daemon=True),
             threading.Thread(target=self._audio_thread, daemon=True),
             threading.Thread(target=self._stt_thread, daemon=True),
+            threading.Thread(target=self._fast_gate_thread, daemon=True),
+            threading.Thread(target=self._kws_thread, daemon=True),
             threading.Thread(target=self._sync_thread, daemon=True),
             threading.Thread(target=self._output_thread, daemon=True),
             threading.Thread(target=self._health_thread, daemon=True),
@@ -720,8 +1073,8 @@ def parse_args():
     parser.add_argument('--video-source', type=int, default=0)
     parser.add_argument('--blur-mode', default='pixelation', choices=['pixelation', 'heavy', 'extreme', 'black'])
     parser.add_argument('--recall-mode', default='high', choices=['high', 'balanced', 'precision'])
-    parser.add_argument('--target-latency-ms', type=float, default=150.0)
-    parser.add_argument('--max-latency-ms', type=float, default=230.0)
+    parser.add_argument('--target-latency-ms', type=float, default=FilterConfig.target_latency_ms)
+    parser.add_argument('--max-latency-ms', type=float, default=FilterConfig.max_latency_ms)
     parser.add_argument('--sync-tolerance-ms', type=float, default=40.0)
     parser.add_argument('--use-virtual-cam', action='store_true')
     parser.add_argument('--virtual-cam-device', default='NeonGuard Virtual Camera')
@@ -729,13 +1082,25 @@ def parse_args():
     parser.add_argument('--health-log-path', default='runtime_health.jsonl')
     parser.add_argument('--health-log-interval-s', type=float, default=5.0)
     parser.add_argument('--disable-live-stt-censor', action='store_true')
-    parser.add_argument('--stt-model-size', default='tiny')
-    parser.add_argument('--stt-window-s', type=float, default=2.0)
-    parser.add_argument('--stt-poll-interval-s', type=float, default=1.2)
+    parser.add_argument('--stt-model-size', default=FilterConfig.stt_model_size)
+    parser.add_argument('--stt-window-s', type=float, default=FilterConfig.stt_window_s)
+    parser.add_argument('--stt-poll-interval-s', type=float, default=FilterConfig.stt_poll_interval_s)
     parser.add_argument('--stt-temp-wav', default='live_stt_window.wav')
     parser.add_argument('--disable-stt-force-keyword-fallback', action='store_true')
-    parser.add_argument('--stt-alignment-delay-ms', type=float, default=350.0)
+    parser.add_argument('--stt-alignment-delay-ms', type=float, default=FilterConfig.stt_alignment_delay_ms)
+    parser.add_argument('--stt-vad-filter', action='store_true', help='Enable VAD filter (may miss short words)')
+    parser.add_argument('--stt-language', default="en", help='Whisper language code (set empty for auto)')
     parser.add_argument('--video-detection-interval', type=int, default=3)
+    parser.add_argument('--disable-fast-audio-gate', action='store_true')
+    parser.add_argument('--fast-gate-window-s', type=float, default=FilterConfig.fast_gate_window_s)
+    parser.add_argument('--fast-gate-poll-interval-s', type=float, default=FilterConfig.fast_gate_poll_interval_s)
+    parser.add_argument('--fast-gate-beep-ms', type=float, default=FilterConfig.fast_gate_beep_ms)
+    parser.add_argument('--fast-gate-cooldown-ms', type=float, default=FilterConfig.fast_gate_cooldown_ms)
+    parser.add_argument('--fast-gate-temp-wav', default='fast_gate_window.wav')
+    parser.add_argument('--enable-kws', action='store_true')
+    parser.add_argument('--kws-model-path', default="vosk-model-small-en-us-0.15")
+    parser.add_argument('--kws-cooldown-ms', type=float, default=500.0)
+    parser.add_argument('--kws-beep-ms', type=float, default=320.0)
     parser.add_argument('--list-audio-devices', action='store_true')
     return parser.parse_args()
 
@@ -767,7 +1132,19 @@ if __name__ == '__main__':
         stt_temp_wav=args.stt_temp_wav,
         stt_force_keyword_fallback=not args.disable_stt_force_keyword_fallback,
         stt_alignment_delay_ms=args.stt_alignment_delay_ms,
+        stt_vad_filter=bool(args.stt_vad_filter),
+        stt_language=(args.stt_language if args.stt_language else None),
         video_detection_interval=args.video_detection_interval,
+        enable_fast_audio_gate=not args.disable_fast_audio_gate,
+        fast_gate_window_s=args.fast_gate_window_s,
+        fast_gate_poll_interval_s=args.fast_gate_poll_interval_s,
+        fast_gate_beep_ms=args.fast_gate_beep_ms,
+        fast_gate_cooldown_ms=args.fast_gate_cooldown_ms,
+        fast_gate_temp_wav=args.fast_gate_temp_wav,
+        enable_kws=args.enable_kws,
+        kws_model_path=args.kws_model_path,
+        kws_cooldown_ms=args.kws_cooldown_ms,
+        kws_beep_ms=args.kws_beep_ms,
     )
 
     print('=' * 70)

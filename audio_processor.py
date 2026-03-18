@@ -21,14 +21,14 @@ try:
     EMBEDDINGS_AVAILABLE = True
 except ImportError:
     EMBEDDINGS_AVAILABLE = False
-    print("⚠ sentence-transformers not available")
+    print("[WARN] sentence-transformers not available")
 
 try:
     from better_profanity import profanity
     PROFANITY_LIB_AVAILABLE = True
 except ImportError:
     PROFANITY_LIB_AVAILABLE = False
-    print("⚠ better-profanity not available")
+    print("[WARN] better-profanity not available")
 
 try:
     from faster_whisper import WhisperModel
@@ -47,14 +47,17 @@ class AudioTranscriber:
             try:
                 self.model = WhisperModel(model_size, device=device, compute_type='int8')
             except Exception as exc:
-                print(f"⚠ Failed to initialize faster-whisper: {exc}")
+                print(f"[WARN] Failed to initialize faster-whisper: {exc}")
                 self.available = False
 
-    def transcribe_with_timestamps(self, audio_path):
+    def transcribe_with_timestamps(self, audio_path, vad_filter=True, language=None):
         if not self.available or not self.model:
             return {'text': '', 'segments': []}
 
-        segments, _ = self.model.transcribe(audio_path, vad_filter=True, word_timestamps=True)
+        kwargs = dict(vad_filter=vad_filter, word_timestamps=True)
+        if language:
+            kwargs['language'] = language
+        segments, _ = self.model.transcribe(audio_path, **kwargs)
         out = []
         full_text = []
         for seg in segments:
@@ -70,6 +73,21 @@ class AudioTranscriber:
                 })
             out.append({'text': seg_text, 'start': float(seg.start), 'end': float(seg.end), 'words': words})
 
+        return {'text': ' '.join(full_text).strip(), 'segments': out}
+
+    def transcribe_text(self, audio_path):
+        """Faster path for live gating: returns text only (no word timings)."""
+        if not self.available or not self.model:
+            return {'text': '', 'segments': []}
+
+        segments, _ = self.model.transcribe(audio_path, vad_filter=True, word_timestamps=False)
+        full_text = []
+        out = []
+        for seg in segments:
+            seg_text = (seg.text or '').strip()
+            if seg_text:
+                full_text.append(seg_text)
+            out.append({'text': seg_text, 'start': float(seg.start), 'end': float(seg.end), 'words': []})
         return {'text': ' '.join(full_text).strip(), 'segments': out}
 
 
@@ -102,7 +120,7 @@ class AdvancedProfanityDetector:
           False - Catch everything (damn, hell, crap)
           True - Only catch severe profanity (fuck, shit, slurs)
         """
-        print("\n🔧 Initializing Advanced Profanity Detector...")
+        print("\n[INIT] Initializing Advanced Profanity Detector...")
         
         self.recall_mode = recall_mode
         self.allow_mild_profanity = allow_mild_profanity
@@ -126,20 +144,20 @@ class AdvancedProfanityDetector:
             'false_negatives_reported': 0
         }
         
-        print(f"✓ Mode: {recall_mode.upper()}")
-        print(f"✓ Mild profanity: {'ALLOWED' if allow_mild_profanity else 'BLOCKED'}")
-        print("✓ Initialization complete\n")
+        print(f"[OK] Mode: {recall_mode.upper()}")
+        print(f"[OK] Mild profanity: {'ALLOWED' if allow_mild_profanity else 'BLOCKED'}")
+        print("[OK] Initialization complete\n")
     
     def _load_embedding_model(self):
         """Load sentence transformer for semantic matching"""
         if EMBEDDINGS_AVAILABLE:
-            print("Loading embedding model...")
+            print("[INIT] Loading embedding model...")
             self.model = SentenceTransformer('all-MiniLM-L6-v2')
             self.embeddings_available = True
-            print("✓ Embeddings loaded")
+            print("[OK] Embeddings loaded")
         else:
             self.embeddings_available = False
-            print("⚠ Embeddings unavailable - reduced accuracy")
+            print("[WARN] Embeddings unavailable - reduced accuracy")
     
     def _load_profanity_database(self):
         """Load comprehensive profanity database"""
@@ -185,16 +203,16 @@ class AdvancedProfanityDetector:
         
         # Pre-compute embeddings
         if self.embeddings_available:
-            print("Computing profanity embeddings...")
+            print("[INIT] Computing profanity embeddings...")
             self.severe_embeddings = self.model.encode(
                 self.severe_words, show_progress_bar=False
             )
             self.mild_embeddings = self.model.encode(
                 self.mild_words, show_progress_bar=False
             )
-            print("✓ Profanity embeddings computed")
+            print("[OK] Profanity embeddings computed")
         
-        print(f"✓ Database: {len(self.severe_words)} severe, {len(self.mild_words)} mild")
+        print(f"[OK] Database: {len(self.severe_words)} severe, {len(self.mild_words)} mild")
     
     def _load_phonetic_patterns(self):
         """Load phonetic patterns for instant detection"""
@@ -224,7 +242,7 @@ class AdvancedProfanityDetector:
                 re.compile(p, re.IGNORECASE) for p in patterns
             ]
         
-        print(f"✓ Phonetic patterns loaded: {len(self.phonetic_patterns)} categories")
+        print(f"[OK] Phonetic patterns loaded: {len(self.phonetic_patterns)} categories")
     
     def _load_context_rules(self):
         """Load context rules for reducing false positives"""
@@ -253,7 +271,7 @@ class AdvancedProfanityDetector:
             re.compile(p, re.IGNORECASE) for p in self.aggressive_contexts
         ]
         
-        print(f"✓ Context rules loaded")
+        print(f"[OK] Context rules loaded")
     
     def _set_thresholds(self):
         """Set detection thresholds based on recall mode"""
@@ -276,7 +294,7 @@ class AdvancedProfanityDetector:
             self.confidence_threshold = 0.6
             self.min_votes = 2
         
-        print(f"✓ Thresholds: embedding={self.embedding_threshold}, "
+        print(f"[OK] Thresholds: embedding={self.embedding_threshold}, "
               f"confidence={self.confidence_threshold}, votes={self.min_votes}")
     
     # ══════════════════════════════════════════════════════════════════════
@@ -554,13 +572,13 @@ class AdvancedProfanityDetector:
     def report_false_positive(self, text):
         """User reports: this was NOT profanity (false positive)"""
         self.stats['false_positives_reported'] += 1
-        print(f"📝 False positive reported: \"{text}\"")
+        print(f"[NOTE] False positive reported: \"{text}\"")
         # In production: log to file for retraining
     
     def report_false_negative(self, text):
         """User reports: this WAS profanity but we missed it (false negative)"""
         self.stats['false_negatives_reported'] += 1
-        print(f"📝 False negative reported: \"{text}\"")
+        print(f"[NOTE] False negative reported: \"{text}\"")
         # In production: add to database, retrain
     
     def get_metrics(self):
@@ -662,16 +680,16 @@ if __name__ == "__main__":
         # Calculate metrics
         if should_detect and is_profane:
             true_positives += 1
-            print("  ✓ TRUE POSITIVE")
+            print("  [OK] TRUE POSITIVE")
         elif should_detect and not is_profane:
             false_negatives += 1
-            print("  ❌ FALSE NEGATIVE (missed profanity!)")
+            print("  [FAIL] FALSE NEGATIVE (missed profanity!)")
         elif not should_detect and is_profane:
             false_positives += 1
-            print("  ⚠️  FALSE POSITIVE (incorrectly flagged)")
+            print("  [WARN] FALSE POSITIVE (incorrectly flagged)")
         else:
             true_negatives += 1
-            print("  ✓ TRUE NEGATIVE")
+            print("  [OK] TRUE NEGATIVE")
         
         print()
         time.sleep(0.3)
@@ -701,8 +719,8 @@ if __name__ == "__main__":
     print()
     print("Confusion Matrix:")
     print(f"  True Positives:  {true_positives}")
-    print(f"  False Negatives: {false_negatives} ⚠️  (profanity we missed)")
-    print(f"  False Positives: {false_positives} ⚠️  (false alarms)")
+    print(f"  False Negatives: {false_negatives} [WARN] (profanity we missed)")
+    print(f"  False Positives: {false_positives} [WARN] (false alarms)")
     print(f"  True Negatives:  {true_negatives}")
     print("="*70)
     
@@ -714,12 +732,12 @@ if __name__ == "__main__":
     print(f"  Model votes: {metrics['model_votes']}")
     print("="*70)
     
-    print("\n✓ Test complete!")
+    print("\n[OK] Test complete!")
     print(f"\nFor streaming, you want:")
     print(f"  Recall: 90%+ (current: {recall:.1%})")
     print(f"  Precision: 85%+ (current: {precision:.1%})")
     
     if recall < 0.9:
-        print(f"\n⚠️  Recall too low! Try 'high' mode or lower thresholds")
+        print(f"\n[WARN] Recall too low! Try 'high' mode or lower thresholds")
     if precision < 0.85:
-        print(f"\n⚠️  Precision too low! Try 'precision' mode or raise thresholds")
+        print(f"\n[WARN] Precision too low! Try 'precision' mode or raise thresholds")
