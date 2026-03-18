@@ -430,16 +430,12 @@ class StreamingFilterProduction:
             return
         if now_mono - self.last_stt_at < cfg.stt_poll_interval_s:
             return
-        if len(self.audio_history) < 2:
+        window, start_ts, _ = self._recent_audio_window(cfg.stt_window_s)
+        if window is None or window.size == 0:
             return
 
         self.last_stt_at = now_mono
-        start_ts = self.audio_history[0][1]
-        window = np.concatenate([a for a, _ in self.audio_history])
-        if window.size == 0:
-            return
-
-        payload = {'window': window.copy(), 'start_ts': start_ts}
+        payload = {'window': window, 'start_ts': start_ts}
         try:
             self.stt_queue.put_nowait(payload)
         except Exception:
@@ -456,34 +452,14 @@ class StreamingFilterProduction:
             return
         if now_mono - self.last_fast_gate_at < cfg.fast_gate_poll_interval_s:
             return
-        if len(self.audio_history) < 2:
+        window, window_start_ts, window_end_ts = self._recent_audio_window(cfg.fast_gate_window_s)
+        if window is None or window.size == 0:
             return
 
-        # Take only the most recent fast_gate_window_s of audio (and keep its audio-timeline timestamps).
-        samples_needed = int(self.audio_rate * cfg.fast_gate_window_s)
-        chunks = []
-        total = 0
-        window_start_ts = None
-        window_end_ts = None
-        # Walk newest -> oldest.
-        for a, a_ts in reversed(self.audio_history):
-            chunks.append(a)
-            total += len(a)
-            window_start_ts = a_ts
-            if total >= samples_needed:
-                break
-        if total < max(1, samples_needed // 2):
-            return
-
-        # End ts is the end of the most recent chunk we included.
-        last_chunk, last_ts = self.audio_history[-1]
-        window_end_ts = float(last_ts) + (len(last_chunk) / float(self.audio_rate))
-
-        window = np.concatenate(list(reversed(chunks)))[-samples_needed:]
         payload = {
-            'window': window.copy(),
-            'window_start_ts': float(window_start_ts) if window_start_ts is not None else float(self.audio_history[0][1]),
-            'window_end_ts': float(window_end_ts),
+            'window': window,
+            'window_start_ts': window_start_ts,
+            'window_end_ts': window_end_ts,
         }
         self.last_fast_gate_at = now_mono
         try:
@@ -1085,7 +1061,7 @@ def parse_args():
     parser.add_argument('--stt-alignment-delay-ms', type=float, default=FilterConfig.stt_alignment_delay_ms)
     parser.add_argument('--stt-vad-filter', action='store_true', help='Enable VAD filter (may miss short words)')
     parser.add_argument('--stt-language', default="en", help='Whisper language code (set empty for auto)')
-    parser.add_argument('--video-detection-interval', type=int, default=3)
+    parser.add_argument('--video-detection-interval', type=int, default=FilterConfig.video_detection_interval)
     parser.add_argument('--disable-fast-audio-gate', action='store_true')
     parser.add_argument('--fast-gate-window-s', type=float, default=FilterConfig.fast_gate_window_s)
     parser.add_argument('--fast-gate-poll-interval-s', type=float, default=FilterConfig.fast_gate_poll_interval_s)
