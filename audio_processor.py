@@ -9,6 +9,9 @@ Multi-model ensemble approach:
   4. Confidence scoring (reduces false positives)
 """
 
+import os
+import pickle
+import sqlite3
 import numpy as np
 import re
 from collections import defaultdict, deque
@@ -36,28 +39,45 @@ try:
 except ImportError:
     FASTER_WHISPER_AVAILABLE = False
 
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+
 
 class AudioTranscriber:
     """STT front-end for profanity filtering pipelines."""
 
-    def __init__(self, model_size='base', device='cpu'):
+    def __init__(self, model_size='base', device='auto'):
         self.available = FASTER_WHISPER_AVAILABLE
         self.model = None
+        self.device = self._resolve_device(device)
+        self.compute_type = 'float16' if self.device == 'cuda' else 'int8'
         if self.available:
             try:
-                self.model = WhisperModel(model_size, device=device, compute_type='int8')
+                self.model = WhisperModel(model_size, device=self.device, compute_type=self.compute_type)
+                print(f"[OK] faster-whisper running on {self.device.upper()} ({self.compute_type})")
             except Exception as exc:
-                print(f"[WARN] Failed to initialize faster-whisper: {exc}")
+                print(f"[WARN] Failed to initialize faster-whisper on {self.device}: {exc}")
                 self.available = False
 
-    def transcribe_with_timestamps(self, audio_path, vad_filter=True, language=None):
+    @staticmethod
+    def _resolve_device(device):
+        if device and device != 'auto':
+            return device
+        if TORCH_AVAILABLE and getattr(torch, 'cuda', None) and torch.cuda.is_available():
+            return 'cuda'
+        return 'cpu'
+
+    def transcribe_with_timestamps(self, audio_source, vad_filter=True, language=None):
         if not self.available or not self.model:
             return {'text': '', 'segments': []}
 
         kwargs = dict(vad_filter=vad_filter, word_timestamps=True)
         if language:
             kwargs['language'] = language
-        segments, _ = self.model.transcribe(audio_path, **kwargs)
+        segments, _ = self.model.transcribe(audio_source, **kwargs)
         out = []
         full_text = []
         for seg in segments:
@@ -75,12 +95,12 @@ class AudioTranscriber:
 
         return {'text': ' '.join(full_text).strip(), 'segments': out}
 
-    def transcribe_text(self, audio_path):
+    def transcribe_text(self, audio_source):
         """Faster path for live gating: returns text only (no word timings)."""
         if not self.available or not self.model:
             return {'text': '', 'segments': []}
 
-        segments, _ = self.model.transcribe(audio_path, vad_filter=True, word_timestamps=False)
+        segments, _ = self.model.transcribe(audio_source, vad_filter=True, word_timestamps=False)
         full_text = []
         out = []
         for seg in segments:
@@ -125,11 +145,18 @@ class AdvancedProfanityDetector:
         self.recall_mode = recall_mode
         self.allow_mild_profanity = allow_mild_profanity
         
+        self.cache_dir = os.path.join(os.path.dirname(__file__), '.cache')
+        os.makedirs(self.cache_dir, exist_ok=True)
+        self.embedding_cache_path = os.path.join(self.cache_dir, 'embedding_cache.pkl')
+        self.feedback_db_path = os.path.join(self.cache_dir, 'profanity_feedback.sqlite3')
+        self.embedding_cache = self._load_embedding_cache()
+
         # Load models
         self._load_embedding_model()
         self._load_profanity_database()
         self._load_phonetic_patterns()
         self._load_context_rules()
+        self._init_feedback_db()
         
         # Set thresholds based on mode
         self._set_thresholds()
@@ -204,16 +231,28 @@ class AdvancedProfanityDetector:
         # Pre-compute embeddings
         if self.embeddings_available:
             print("[INIT] Computing profanity embeddings...")
-            self.severe_embeddings = self.model.encode(
+            self.severe_embeddings = np.asarray(self.model.encode(
                 self.severe_words, show_progress_bar=False
-            )
-            self.mild_embeddings = self.model.encode(
+            ), dtype=np.float32)
+            self.mild_embeddings = np.asarray(self.model.encode(
                 self.mild_words, show_progress_bar=False
-            )
+            ), dtype=np.float32)
+            self.severe_embedding_matrix = self._normalize_embedding_matrix(self.severe_embeddings)
+            self.mild_embedding_matrix = self._normalize_embedding_matrix(self.mild_embeddings)
             print("[OK] Profanity embeddings computed")
         
         print(f"[OK] Database: {len(self.severe_words)} severe, {len(self.mild_words)} mild")
     
+
+    @staticmethod
+    def _normalize_embedding_matrix(matrix):
+        if matrix is None or len(matrix) == 0:
+            return np.empty((0, 0), dtype=np.float32)
+        matrix = np.asarray(matrix, dtype=np.float32)
+        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        return matrix / norms
+
     def _load_phonetic_patterns(self):
         """Load phonetic patterns for instant detection"""
         
@@ -225,7 +264,7 @@ class AdvancedProfanityDetector:
             ],
             's_word': [
                 r'\bs+[h\*]+[i\*]+t+',  # shit, sh*t, shiit
-                r'\bs+[aeiou]+t+',      # sat, sit, sot
+                r'\bsh[i\*]+t+',         # require the 'h' to avoid clean words like sit/set
             ],
             'b_word': [
                 r'\bb+[i\*]+t+c+h+',    # bitch, b*tch
@@ -272,6 +311,50 @@ class AdvancedProfanityDetector:
         ]
         
         print(f"[OK] Context rules loaded")
+
+    def _load_embedding_cache(self):
+        if not os.path.exists(self.embedding_cache_path):
+            return {}
+        try:
+            with open(self.embedding_cache_path, 'rb') as fh:
+                data = pickle.load(fh)
+            return data if isinstance(data, dict) else {}
+        except Exception as exc:
+            print(f"[WARN] Failed to load embedding cache: {exc}")
+            return {}
+
+    def _save_embedding_cache(self):
+        try:
+            with open(self.embedding_cache_path, 'wb') as fh:
+                pickle.dump(self.embedding_cache, fh)
+        except Exception as exc:
+            print(f"[WARN] Failed to save embedding cache: {exc}")
+
+    def _init_feedback_db(self):
+        try:
+            with sqlite3.connect(self.feedback_db_path) as conn:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS feedback_reports (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        label TEXT NOT NULL,
+                        text TEXT NOT NULL,
+                        created_at REAL NOT NULL
+                    )
+                """)
+                conn.commit()
+        except Exception as exc:
+            print(f"[WARN] Failed to initialize feedback DB: {exc}")
+
+    def _record_feedback(self, label, text):
+        try:
+            with sqlite3.connect(self.feedback_db_path) as conn:
+                conn.execute(
+                    "INSERT INTO feedback_reports(label, text, created_at) VALUES (?, ?, ?)",
+                    (label, text, time.time()),
+                )
+                conn.commit()
+        except Exception as exc:
+            print(f"[WARN] Failed to store feedback report: {exc}")
     
     def _set_thresholds(self):
         """Set detection thresholds based on recall mode"""
@@ -353,7 +436,14 @@ class AdvancedProfanityDetector:
     def _cached_encode(self, text):
         if not self.embeddings_available:
             return None
-        return self.model.encode([text])[0]
+        cached = self.embedding_cache.get(text)
+        if cached is not None:
+            return np.asarray(cached, dtype=np.float32)
+
+        embedding = np.asarray(self.model.encode([text])[0], dtype=np.float32)
+        self.embedding_cache[text] = embedding
+        self._save_embedding_cache()
+        return embedding
 
     @staticmethod
     def _normalize_token(token):
@@ -367,37 +457,30 @@ class AdvancedProfanityDetector:
         text_embedding = self._cached_encode(text.lower())
         matches = []
         
-        # Check severe profanity
-        for i, word in enumerate(self.severe_words):
-            similarity = self._cosine_similarity(
-                text_embedding, 
-                self.severe_embeddings[i]
-            )
-            
-            if similarity > self.embedding_threshold:
+        text_embedding = np.asarray(text_embedding, dtype=np.float32)
+        text_norm = np.linalg.norm(text_embedding)
+        if text_norm == 0:
+            return []
+
+        severe_scores = np.dot(self.severe_embedding_matrix, text_embedding / text_norm)
+        for i in np.where(severe_scores > self.embedding_threshold)[0]:
+            matches.append({
+                'word': self.severe_words[int(i)],
+                'method': 'semantic',
+                'confidence': float(severe_scores[int(i)]),
+                'severity': 'severe'
+            })
+
+        if not self.allow_mild_profanity and len(self.mild_words):
+            mild_scores = np.dot(self.mild_embedding_matrix, text_embedding / text_norm)
+            for i in np.where(mild_scores > self.embedding_threshold)[0]:
                 matches.append({
-                    'word': word,
+                    'word': self.mild_words[int(i)],
                     'method': 'semantic',
-                    'confidence': similarity,
-                    'severity': 'severe'
+                    'confidence': float(mild_scores[int(i)]),
+                    'severity': 'mild'
                 })
-        
-        # Check mild profanity
-        if not self.allow_mild_profanity:
-            for i, word in enumerate(self.mild_words):
-                similarity = self._cosine_similarity(
-                    text_embedding,
-                    self.mild_embeddings[i]
-                )
-                
-                if similarity > self.embedding_threshold:
-                    matches.append({
-                        'word': word,
-                        'method': 'semantic',
-                        'confidence': similarity,
-                        'severity': 'mild'
-                    })
-        
+
         return matches
     
     def detect_context(self, text):
@@ -573,13 +656,13 @@ class AdvancedProfanityDetector:
         """User reports: this was NOT profanity (false positive)"""
         self.stats['false_positives_reported'] += 1
         print(f"[NOTE] False positive reported: \"{text}\"")
-        # In production: log to file for retraining
+        self._record_feedback('false_positive', text)
     
     def report_false_negative(self, text):
         """User reports: this WAS profanity but we missed it (false negative)"""
         self.stats['false_negatives_reported'] += 1
         print(f"[NOTE] False negative reported: \"{text}\"")
-        # In production: add to database, retrain
+        self._record_feedback('false_negative', text)
     
     def get_metrics(self):
         """Get performance metrics"""

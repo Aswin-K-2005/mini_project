@@ -12,6 +12,12 @@ import urllib.request
 from dataclasses import dataclass
 
 try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+
+try:
     from nudenet import NudeDetector
     NUDENET_AVAILABLE = True
 except ImportError:
@@ -68,9 +74,14 @@ class VideoProcessorTestComplete:
         self.nudenet_available = False
         if NUDENET_AVAILABLE:
             try:
-                self.nude_detector = NudeDetector()
+                device = 'cuda' if TORCH_AVAILABLE and getattr(torch, 'cuda', None) and torch.cuda.is_available() else 'cpu'
+                os.environ.setdefault('CUDA_VISIBLE_DEVICES', '0' if device == 'cuda' else '')
+                try:
+                    self.nude_detector = NudeDetector(inference_resolution=320, providers=['CUDAExecutionProvider', 'CPUExecutionProvider'] if device == 'cuda' else ['CPUExecutionProvider'])
+                except TypeError:
+                    self.nude_detector = NudeDetector()
                 self.nudenet_available = True
-                print("[OK] NudeNet detector loaded")
+                print(f"[OK] NudeNet detector loaded on {device.upper()}")
             except Exception as e:
                 print(f"[WARN] NudeNet init failed: {e}. Using face fallback.")
 
