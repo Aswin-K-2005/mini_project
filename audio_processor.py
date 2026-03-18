@@ -46,21 +46,13 @@ except ImportError:
     TORCH_AVAILABLE = False
 
 
-def _resolve_whisper_device(device):
-    if device and device != 'auto':
-        return device
-    if TORCH_AVAILABLE and getattr(torch, 'cuda', None) and torch.cuda.is_available():
-        return 'cuda'
-    return 'cpu'
-
-
 class AudioTranscriber:
     """STT front-end for profanity filtering pipelines."""
 
     def __init__(self, model_size='base', device='auto'):
         self.available = FASTER_WHISPER_AVAILABLE
         self.model = None
-        self.device = _resolve_whisper_device(device)
+        self.device = self._resolve_device(device)
         self.compute_type = 'float16' if self.device == 'cuda' else 'int8'
         if self.available:
             try:
