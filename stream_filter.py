@@ -424,40 +424,6 @@ class StreamingFilterProduction:
         buf.seek(0)
         return buf
 
-    def _recent_audio_window(self, seconds):
-        samples_needed = max(1, int(self.audio_rate * float(seconds)))
-        if len(self.audio_history) < 2:
-            return None, None, None
-
-        chunks = []
-        total = 0
-        start_ts = None
-        last_chunk = None
-        last_ts = None
-
-        for chunk, chunk_ts in reversed(self.audio_history):
-            if last_chunk is None:
-                last_chunk = chunk
-                last_ts = chunk_ts
-            chunks.append(chunk)
-            total += len(chunk)
-            start_ts = chunk_ts
-            if total >= samples_needed:
-                break
-
-        minimum_samples = max(self.audio_chunk * 2, samples_needed // 2)
-        if total < minimum_samples:
-            return None, None, None
-
-        window = np.concatenate(list(reversed(chunks)))
-        if len(window) > samples_needed:
-            trim = len(window) - samples_needed
-            window = window[-samples_needed:]
-            start_ts = float(start_ts) + (trim / float(self.audio_rate))
-
-        end_ts = float(last_ts) + (len(last_chunk) / float(self.audio_rate))
-        return window.copy(), float(start_ts), float(end_ts)
-
     def _schedule_live_stt_beep_events(self, now_mono):
         cfg = self.config
         if not cfg.enable_live_stt_censor or not self.audio_transcriber.available:

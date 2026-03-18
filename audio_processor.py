@@ -62,14 +62,6 @@ class AudioTranscriber:
                 print(f"[WARN] Failed to initialize faster-whisper on {self.device}: {exc}")
                 self.available = False
 
-    @staticmethod
-    def _resolve_device(device):
-        if device and device != 'auto':
-            return device
-        if TORCH_AVAILABLE and getattr(torch, 'cuda', None) and torch.cuda.is_available():
-            return 'cuda'
-        return 'cpu'
-
     def transcribe_with_timestamps(self, audio_source, vad_filter=True, language=None):
         if not self.available or not self.model:
             return {'text': '', 'segments': []}
