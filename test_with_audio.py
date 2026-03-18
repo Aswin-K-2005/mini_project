@@ -15,7 +15,7 @@ try:
     PYDUB_AVAILABLE = True
 except ImportError:
     PYDUB_AVAILABLE = False
-                print("[WARN] pydub not available - install: pip install pydub")
+    print("[WARN] pydub not available - install: pip install pydub")
 
 # Speech recognition
 try:

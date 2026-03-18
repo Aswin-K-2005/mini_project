@@ -3,6 +3,7 @@ stream_filter.py - production-oriented low-latency A/V filtering pipeline.
 """
 
 import argparse
+import io
 import json
 import os
 import threading
@@ -57,8 +58,8 @@ class FilterConfig:
     stt_vad_filter: bool = False
     stt_language: str | None = "en"
     # Extra hold so STT results arrive before playback.
-    stt_alignment_delay_ms: float = 750.0
-    video_detection_interval: int = 3
+    stt_alignment_delay_ms: float = 350.0
+    video_detection_interval: int = 4
     enable_fast_audio_gate: bool = True
     # Lightweight safety net (still uses STT, but no word timestamps): forces an immediate beep.
     fast_gate_window_s: float = 0.8
@@ -411,14 +412,17 @@ class StreamingFilterProduction:
         except Exception:
             self._safe_stat_inc(drop_stat_key)
 
-    def _write_temp_wav(self, samples, path):
+    def _audio_window_to_wav_bytes(self, samples):
         pcm = np.clip(samples, -1.0, 1.0)
         pcm_i16 = (pcm * 32767).astype(np.int16)
-        with wave.open(path, 'wb') as wf:
+        buf = io.BytesIO()
+        with wave.open(buf, 'wb') as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
             wf.setframerate(self.audio_rate)
             wf.writeframes(pcm_i16.tobytes())
+        buf.seek(0)
+        return buf
 
     def _schedule_live_stt_beep_events(self, now_mono):
         cfg = self.config
@@ -504,9 +508,8 @@ class StreamingFilterProduction:
             window_start_ts = float(payload.get('window_start_ts', time.monotonic()))
             window_end_ts = float(payload.get('window_end_ts', window_start_ts))
             try:
-                # Use a dedicated temp wav path to avoid races with the STT thread.
-                self._write_temp_wav(window, cfg.fast_gate_temp_wav)
-                transcript = self.audio_transcriber.transcribe_text(cfg.fast_gate_temp_wav)
+                window_wav = self._audio_window_to_wav_bytes(window)
+                transcript = self.audio_transcriber.transcribe_text(window_wav)
                 text = (transcript.get('text', '') or '').strip()
                 self._safe_stat_inc('fast_gate_runs')
 
@@ -528,11 +531,7 @@ class StreamingFilterProduction:
             except Exception:
                 self._safe_stat_inc('runtime_errors')
             finally:
-                if os.path.exists(cfg.fast_gate_temp_wav):
-                    try:
-                        os.remove(cfg.fast_gate_temp_wav)
-                    except OSError:
-                        pass
+                pass
 
     def _kws_thread(self):
         """Streaming keyword spotting using Vosk partial results."""
@@ -623,9 +622,9 @@ class StreamingFilterProduction:
             window = payload['window']
             start_ts = payload['start_ts']
             try:
-                self._write_temp_wav(window, cfg.stt_temp_wav)
+                window_wav = self._audio_window_to_wav_bytes(window)
                 transcript = self.audio_transcriber.transcribe_with_timestamps(
-                    cfg.stt_temp_wav,
+                    window_wav,
                     vad_filter=bool(cfg.stt_vad_filter),
                     language=cfg.stt_language,
                 )
@@ -683,11 +682,7 @@ class StreamingFilterProduction:
             except Exception:
                 self._safe_stat_inc('runtime_errors')
             finally:
-                if os.path.exists(cfg.stt_temp_wav):
-                    try:
-                        os.remove(cfg.stt_temp_wav)
-                    except OSError:
-                        pass
+                pass
 
     def _apply_scheduled_beeps(self, audio_chunk, chunk_ts):
         with self.beep_lock:
